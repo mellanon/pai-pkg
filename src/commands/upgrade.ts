@@ -495,8 +495,15 @@ export async function upgradePackage(
     }
   }
 
-  // Re-symlink component files if this is a component
-  if (manifest.type === "component" && manifest.provides?.files?.length) {
+  // Re-symlink provides.files drops for types whose payload is provides.files.
+  // component: no per-type primary layout. governance (arc#361): the ENTIRE
+  // install payload is provides.files — without this re-drop, a governance
+  // package that adds or moves a drop between versions never lands it on
+  // upgrade.
+  if (
+    (manifest.type === "component" || manifest.type === "governance") &&
+    manifest.provides?.files?.length
+  ) {
     for (const file of manifest.provides.files) {
       const sourcePath = join(installPath, file.source);
       const targetPath = resolveProvidesTarget(file.target);
