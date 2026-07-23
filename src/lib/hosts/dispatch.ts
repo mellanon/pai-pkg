@@ -7,6 +7,7 @@ import type { ArtifactType, HostAdapter } from "../../types.js";
  *
  *   - `pipeline` / `action` — arc state (`~/.config/metafactory/{pipelines,actions}/`)
  *   - `rules`               — writes templates into the consumer repo
+ *   - `governance`          — provides.files drops + consumer-repo templates only
  *   - `library`             — meta type; contained artifacts route individually
  *   - `component`           — no per-type primary layout; uses provides.files only
  *
@@ -49,6 +50,7 @@ export function hostPathFor(
       return host.paths.binDir;
     case "component":
     case "rules":
+    case "governance":
     case "library":
     case "pipeline":
     case "action":

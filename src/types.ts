@@ -3,7 +3,7 @@
 // ── Artifact types ─────────────────────────────────────────────
 
 /** The artifact classes arc installs. */
-export type ArtifactType = "skill" | "agent" | "prompt" | "tool" | "component" | "pipeline" | "process" | "rules" | "library" | "action";
+export type ArtifactType = "skill" | "system" | "agent" | "prompt" | "tool" | "component" | "pipeline" | "process" | "rules" | "library" | "action" | "governance";
 
 // ── Registry types ────────────────────────────────────────────
 
@@ -413,7 +413,7 @@ export interface ArcManifest {
   schema?: "arc/v1" | "pai/v1";
   name: string;
   version: string;
-  type: "skill" | "system" | "tool" | "agent" | "prompt" | "component" | "pipeline" | "process" | "rules" | "library" | "action";
+  type: "skill" | "system" | "tool" | "agent" | "prompt" | "component" | "pipeline" | "process" | "rules" | "library" | "action" | "governance";
   /** Only present when type is "library" — lists contained artifacts */
   artifacts?: LibraryArtifactEntry[];
   /**

@@ -37,7 +37,7 @@ import { isLinuxSystemdHost } from "./hosts/linux-systemd.js";
  *
  * It is the union of:
  *   - every case handled by `planArtifactSymlinks` below — skill, system, tool,
- *     agent, prompt, component, pipeline, rules, action; and
+ *     agent, prompt, component, pipeline, rules, action, governance; and
  *   - the two types intercepted earlier, in `readManifest` (manifest.ts), which
  *     never reach `planArtifactSymlinks` — library and process.
  *
@@ -57,12 +57,13 @@ export const INSTALLABLE_ARTIFACT_TYPES = [
   "action",
   "library",
   "process",
+  "governance",
 ] as const;
 
 /**
  * Maps an artifact type to its conventional source subdirectory within a cloned repo.
  *
- * - rules, component, tool -> baseDir (no subdirectory)
+ * - rules, governance, component, tool -> baseDir (no subdirectory)
  * - pipeline -> join(baseDir, "pipeline") if it exists, else baseDir
  * - agent -> join(baseDir, "agent")
  * - prompt -> join(baseDir, "prompt")
@@ -72,6 +73,7 @@ export function resolveArtifactSourceDir(type: ArtifactType | "rules" | "system"
   switch (type) {
     case "action":
     case "rules":
+    case "governance":
     case "component":
     case "tool":
       return baseDir;
@@ -201,6 +203,14 @@ export function planArtifactSymlinks(opts: ArtifactSymlinkOpts): ArtifactSymlink
     case "rules": {
       // Rules packages produce no symlink target -- they generate templates
       // into the consumer repo (done only in the apply step). Nothing to plan.
+      break;
+    }
+
+    case "governance": {
+      // Governance packages (arc#361) have no per-type primary layout: their
+      // drops are declared via provides.files (handled by the type-agnostic
+      // pass below) and provides.templates render like `rules` in the apply
+      // step. Nothing to plan here.
       break;
     }
 
@@ -508,9 +518,9 @@ export async function createArtifactSymlinks(opts: {
     return { filesCreated: [], filesMissingSource: plan.filesMissingSource, record };
   }
 
-  // `rules` is the one type whose apply step has a side effect with no symlink
-  // target (template generation into the consumer repo).
-  if (type === "rules") {
+  // `rules` and `governance` are the types whose apply step has a side effect
+  // with no symlink target (template generation into the consumer repo).
+  if (type === "rules" || type === "governance") {
     const templates = manifest.provides?.templates ?? [];
     if (templates.length) {
       const consumerDir = opts.consumerDir ?? process.cwd();

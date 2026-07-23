@@ -459,7 +459,7 @@ export async function upgradePackage(
     // regenerate them (template content may have changed even if the version
     // was already bumped). Keyed off `provides.templates`, NOT `type`: any
     // package that declares templates (e.g. type:rules OR
-    // type:governance-overlay like compass) regenerates them in its consumers
+    // type:governance like compass) regenerates them in its consumers
     // (arc#203).
     if (manifest.provides?.templates?.length) {
       const consumerDirs = findConsumerRepos(manifest.provides.templates);
@@ -568,7 +568,7 @@ export async function upgradePackage(
 
   // Re-generate templates for any package that provides them.
   // Scan all repos with matching config files, not just cwd. Keyed off
-  // `provides.templates`, NOT `type`: type:rules AND type:governance-overlay
+  // `provides.templates`, NOT `type`: type:rules AND type:governance
   // (compass) both regenerate the templates they declare into consumers
   // (arc#203).
   if (manifest.provides?.templates?.length) {
