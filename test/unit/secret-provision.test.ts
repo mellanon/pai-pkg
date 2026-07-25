@@ -19,6 +19,7 @@ import {
   provisionSecrets,
   validateSecretPresence,
   injectSecretsIntoEnv,
+  githubAliasCanonical,
 } from "../../src/lib/secret-provision.js";
 import type { ArcManifest } from "../../src/types.js";
 
@@ -125,6 +126,83 @@ describe("provisionSecrets", () => {
     });
     // The result reports NAMES only — never the value.
     expect(JSON.stringify(result)).not.toContain("super-secret-value");
+  });
+});
+
+// ── arc#358: dedupe the GitHub credential prompt ───────────────────────────
+// The cortex manifest declares the same GitHub credential under both `GH_TOKEN`
+// and `GITHUB_TOKEN` (alternate gh auth vars, same surface). The questionnaire
+// must ask ONCE and store the entered value under every declared spelling —
+// never prompt twice for one credential.
+describe("GitHub credential dedupe (arc#358)", () => {
+  test("prompts once for GH_TOKEN/GITHUB_TOKEN aliases and stores both", async () => {
+    const backend = new FileBackend(secretsRoot, "dev");
+    let prompts = 0;
+    const result = await provisionSecrets(manifest(["GH_TOKEN", "GITHUB_TOKEN"]), {
+      agent: "dev",
+      backend,
+      prompt: async () => {
+        prompts += 1;
+        return "ghp_shared";
+      },
+    });
+    expect(prompts).toBe(1); // asked ONCE, not twice
+    expect(result.stored).toEqual(["GH_TOKEN", "GITHUB_TOKEN"]);
+    expect(await backend.retrieve("GH_TOKEN")).toBe("ghp_shared");
+    expect(await backend.retrieve("GITHUB_TOKEN")).toBe("ghp_shared");
+  });
+
+  test("skipping the single prompt skips every alias spelling", async () => {
+    const backend = new FileBackend(secretsRoot, "dev");
+    let prompts = 0;
+    const result = await provisionSecrets(manifest(["GH_TOKEN", "GITHUB_TOKEN"]), {
+      agent: "dev",
+      backend,
+      prompt: async () => {
+        prompts += 1;
+        return ""; // Return-to-skip
+      },
+    });
+    expect(prompts).toBe(1);
+    expect(result.stored).toEqual([]);
+    expect(result.skipped).toEqual(["GH_TOKEN", "GITHUB_TOKEN"]);
+  });
+
+  test("fromEnv seeds every spelling from whichever one is present", async () => {
+    const backend = new FileBackend(secretsRoot, "dev");
+    const result = await provisionSecrets(manifest(["GH_TOKEN", "GITHUB_TOKEN"]), {
+      agent: "dev",
+      backend,
+      fromEnv: true,
+      env: { GITHUB_TOKEN: "ghp_env" }, // only ONE spelling set
+    });
+    expect(result.stored).toEqual(["GH_TOKEN", "GITHUB_TOKEN"]);
+    expect(await backend.retrieve("GH_TOKEN")).toBe("ghp_env");
+    expect(await backend.retrieve("GITHUB_TOKEN")).toBe("ghp_env");
+  });
+
+  test("distinct prefixed GitHub credentials are NOT merged", async () => {
+    const backend = new FileBackend(secretsRoot, "dev");
+    const seen: string[] = [];
+    await provisionSecrets(manifest(["APPROVER_GH_TOKEN", "GITHUB_TOKEN"]), {
+      agent: "dev",
+      backend,
+      prompt: async (name) => {
+        seen.push(name);
+        return "v";
+      },
+    });
+    // Two genuinely different credentials → two prompts, never collapsed.
+    expect(seen.length).toBe(2);
+  });
+
+  test("githubAliasCanonical folds GH↔GITHUB segments only, never substrings", () => {
+    expect(githubAliasCanonical("GH_TOKEN")).toBe("GITHUB_TOKEN");
+    expect(githubAliasCanonical("GITHUB_TOKEN")).toBe("GITHUB_TOKEN");
+    expect(githubAliasCanonical("APPROVER_GH_TOKEN")).toBe("APPROVER_GITHUB_TOKEN");
+    expect(githubAliasCanonical("NATS_TOKEN")).toBe("NATS_TOKEN");
+    // A distinct prefixed credential must NOT canonicalize to bare GITHUB_TOKEN.
+    expect(githubAliasCanonical("APPROVER_GH_TOKEN")).not.toBe("GITHUB_TOKEN");
   });
 });
 

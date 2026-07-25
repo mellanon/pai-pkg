@@ -92,24 +92,53 @@ export async function provisionSecrets(
 
   const env = opts.env ?? process.env;
 
+  // arc#358: fold GitHub-credential spellings into ONE alias group so the same
+  // credential is asked for ONCE and the entered value is stored under EVERY
+  // declared spelling. `GH_TOKEN` ⇄ `GITHUB_TOKEN` (and `<PREFIX>_GH_TOKEN` ⇄
+  // `<PREFIX>_GITHUB_TOKEN`) are the same token under two names — cortex's
+  // manifest declares both because its `cortex cloud` path reads either env var
+  // (arc-manifest.yaml). We still store both (behavior preserved — the pack
+  // reads whichever it wants); we just never prompt twice. Non-GitHub names fold
+  // to themselves, so every other secret behaves exactly as before.
+  //
+  // Resolution is memoized per canonical group. Because `declared` is iterated
+  // in manifest order and the FIRST-seen member of a group is the one prompted,
+  // `stored`/`skipped` stay in declared order and each name is acted on at its
+  // own position (derive-the-sibling, never re-prompt).
+  const groupDecision = new Map<string, string | undefined>(); // canonical → value (undefined ⇒ skip)
+  const namesInGroup = (canon: string): string[] =>
+    declared.filter((d) => githubAliasCanonical(d.name) === canon).map((d) => d.name);
+
   for (const { name } of declared) {
+    const canon = githubAliasCanonical(name);
     let value: string | undefined;
 
-    if (opts.fromEnv) {
-      value = env[name];
-      if (value === undefined || value === "") {
-        skipped.push(name);
-        continue;
+    if (groupDecision.has(canon)) {
+      // An alias sibling was already resolved this pass — derive it, never
+      // re-prompt / re-read.
+      value = groupDecision.get(canon);
+    } else if (opts.fromEnv) {
+      // Take the first spelling present in the env; it seeds every declared
+      // spelling in the group.
+      for (const member of namesInGroup(canon)) {
+        const v = env[member];
+        if (v !== undefined && v !== "") {
+          value = v;
+          break;
+        }
       }
+      groupDecision.set(canon, value);
     } else {
       const prompt = opts.prompt ?? defaultSecretPrompt;
-      const entered = await prompt(name);
-      if (entered === "") {
-        // Return-to-skip.
-        skipped.push(name);
-        continue;
-      }
-      value = entered;
+      const entered = await prompt(secretPromptLabel(namesInGroup(canon)));
+      // Return-to-skip.
+      value = entered === "" ? undefined : entered;
+      groupDecision.set(canon, value);
+    }
+
+    if (value === undefined || value === "") {
+      skipped.push(name);
+      continue;
     }
 
     try {
@@ -131,6 +160,34 @@ export async function provisionSecrets(
   }
 
   return { stored, skipped };
+}
+
+/**
+ * Canonicalize a secret NAME so the two GitHub-credential spellings fold to one
+ * key (arc#358). A `GH` segment (delimited by `_` or the string bounds) is the
+ * short spelling of `GITHUB`; every other segment is untouched, so:
+ *   - `GH_TOKEN`            → `GITHUB_TOKEN`   (folds with `GITHUB_TOKEN`)
+ *   - `APPROVER_GH_TOKEN`   → `APPROVER_GITHUB_TOKEN` (folds only with its own
+ *                             `APPROVER_GITHUB_TOKEN` sibling — NOT bare
+ *                             `GITHUB_TOKEN`, a genuinely different credential)
+ *   - `NATS_TOKEN`          → `NATS_TOKEN`     (unchanged — no `GH` segment)
+ * Segment-precise matching (never a substring) is what keeps distinct
+ * prefixed credentials from being wrongly merged.
+ */
+export function githubAliasCanonical(name: string): string {
+  return name
+    .split("_")
+    .map((seg) => (seg === "GH" ? "GITHUB" : seg))
+    .join("_");
+}
+
+/**
+ * The prompt label for a credential's alias group. A single name prompts under
+ * itself (unchanged behavior); an aliased group names every spelling so the
+ * operator knows one entry sets them all.
+ */
+function secretPromptLabel(group: string[]): string {
+  return group.length <= 1 ? (group[0] ?? "") : group.join(" / ");
 }
 
 /** Report for {@link validateSecretPresence} — NAMES only. */
