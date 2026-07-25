@@ -121,6 +121,11 @@ export async function createMockSkillRepo(
     /** provides.files entries to declare in the manifest. Source files
      *  are created on disk so install can symlink them. */
     files?: { source: string; target: string; content?: string }[];
+    /** Arbitrary extra files to materialise in the repo (committed), beyond
+     *  what the manifest declares. Use for a purge hook's sibling helpers
+     *  (e.g. `scripts/lib/*.sh`) that arc must snapshot alongside the hook
+     *  (arc#372). Paths are relative to the repo root. */
+    extraFiles?: { path: string; content: string }[];
     /**
      * Ordered lifecycle script arrays (arc#140). Each phase is an ordered
      * list of `{ path, content }`. The helper writes each script to disk
@@ -212,6 +217,13 @@ export async function createMockSkillRepo(
       await Bun.write(scriptAbsPath, script.content);
       // Make executable
       Bun.spawnSync(["chmod", "+x", scriptAbsPath], { stdout: "pipe", stderr: "pipe" });
+    }
+  }
+
+  // Arbitrary extra files (e.g. a purge hook's sibling lib/*.sh — arc#372).
+  if (opts.extraFiles?.length) {
+    for (const f of opts.extraFiles) {
+      await Bun.write(join(repoDir, f.path), f.content);
     }
   }
 
