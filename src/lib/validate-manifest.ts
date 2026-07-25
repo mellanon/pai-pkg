@@ -82,8 +82,19 @@ const VALID_TIERS = ["official", "community", "custom", "core"] as const;
 const NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 /** semver from 0.1.0, optional prerelease/build metadata. */
 const SEMVER_RE = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
-/** namespace: `@scope`, lowercase-hyphenated scope. */
-const NAMESPACE_RE = /^@[a-z0-9-]+$/;
+/**
+ * namespace: the BARE scope, lowercase-hyphenated — `metafactory`, not
+ * `@metafactory` (arc#369).
+ *
+ * The sigil belongs to the display and wire representation, not to this field.
+ * `resolvePublishScope` (lib/publish.ts) returns `manifest.namespace` verbatim
+ * and every consumer then wraps it — `` `@${scope}/${name}` ``,
+ * `` encodeURIComponent(`@${scope}`) `` — so a manifest carrying the sigil
+ * publishes to `%40%40scope`. This regex previously REQUIRED the sigil, which
+ * made a manifest that passed `arc validate` fail to publish; arc's own test
+ * fixtures, README, and every shipping manifest already use the bare form.
+ */
+const NAMESPACE_RE = /^[a-z0-9-]+$/;
 /** A hostname (not a URL). No scheme, no path, no whitespace. */
 const HOST_RE = /^[a-z0-9.-]+$/i;
 /**
@@ -391,7 +402,7 @@ function validateNamespace(manifest: Record<string, unknown>, add: Add): void {
   const namespace = manifest.namespace;
   if (namespace === undefined) return; // optional
   if (typeof namespace !== "string" || !NAMESPACE_RE.test(namespace)) {
-    add("namespace", `when present must match ^@[a-z0-9-]+$; got ${JSON.stringify(namespace)}`);
+    add("namespace", `when present must match ^[a-z0-9-]+$ (BARE scope — the sigil is added by publish, arc#369); got ${JSON.stringify(namespace)}`);
   }
 }
 

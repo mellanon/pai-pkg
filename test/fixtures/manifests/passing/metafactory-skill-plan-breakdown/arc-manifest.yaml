@@ -1,6 +1,6 @@
 schema: arc/v1
 name: plan-breakdown
-namespace: "@metafactory"
+namespace: "metafactory"
 version: 0.1.0
 type: skill
 tier: custom
