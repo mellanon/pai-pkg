@@ -1,6 +1,6 @@
 {
   "name": "arc",
-  "version": "0.44.0",
+  "version": "0.44.1",
   "description": "Agentic component package manager — install, manage, and distribute AI agent skills",
   "type": "module",
   "bin": {
