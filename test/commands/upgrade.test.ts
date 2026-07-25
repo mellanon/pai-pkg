@@ -281,6 +281,172 @@ describe("upgradePackage", () => {
   });
 });
 
+describe("upgradePackage — detached HEAD (tag-checkout install, arc#272)", () => {
+  // Run git in a repo, returning trimmed stdout (throws on failure so a broken
+  // fixture fails loudly rather than silently miscovering the path under test).
+  function git(cwd: string, ...args: string[]): string {
+    const r = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) {
+      throw new Error(`git ${args.join(" ")} failed in ${cwd}: ${r.stderr.toString().trim()}`);
+    }
+    return r.stdout.toString().trim();
+  }
+
+  // True iff HEAD is a detached HEAD (no symbolic branch ref) — the state a
+  // tag-checkout install leaves the clone in, and the exact state `git pull`
+  // cannot upgrade from.
+  function isDetached(cwd: string): boolean {
+    return (
+      Bun.spawnSync(["git", "symbolic-ref", "-q", "HEAD"], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      }).exitCode !== 0
+    );
+  }
+
+  async function bumpAndTag(repoPath: string, from: string, to: string) {
+    const manifestPath = join(repoPath, "arc-manifest.yaml");
+    const content = await Bun.file(manifestPath).text();
+    await writeFile(manifestPath, content.replace(`version: ${from}`, `version: ${to}`));
+    git(repoPath, "add", ".");
+    git(repoPath, "-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", `bump ${to}`);
+    git(repoPath, "tag", `v${to}`);
+  }
+
+  test("advances a detached-at-tag install to a newer release tag", async () => {
+    const repo = await createMockSkillRepo(env.root, { name: "PinnedAdvance", version: "1.0.0" });
+    // Tag the initial release on the origin, then install pinned to it — the
+    // clone lands on a detached HEAD at v1.0.0 (the arc#272 pre-condition).
+    git(repo.path, "tag", "v1.0.0");
+    await install({
+      arc: env.arc, host: env.host, db: env.db,
+      repoUrl: repo.url, yes: true, pinnedVersion: "1.0.0",
+    });
+
+    const installPath = getSkill(env.db, "PinnedAdvance")!.install_path;
+    expect(isDetached(installPath)).toBe(true); // precondition: git pull would fail here
+
+    // Publish a newer release on the origin.
+    await bumpAndTag(repo.path, "1.0.0", "1.1.0");
+
+    const result = await upgradePackage(env.db, env.arc, env.host, "PinnedAdvance");
+    expect(result.success).toBe(true);
+    expect(result.oldVersion).toBe("1.0.0");
+    expect(result.newVersion).toBe("1.1.0");
+
+    // DB advanced.
+    const row = env.db
+      .prepare("SELECT version FROM skills WHERE name = ?")
+      .get("PinnedAdvance") as { version: string };
+    expect(row.version).toBe("1.1.0");
+
+    // On-disk clone advanced to the v1.1.0 tag and stays on a tag (still
+    // detached — the upgrade tracks releases, it does not jump onto a branch).
+    expect(isDetached(installPath)).toBe(true);
+    expect(git(installPath, "tag", "--points-at", "HEAD").split("\n")).toContain("v1.1.0");
+    const manifestText = await Bun.file(join(installPath, "arc-manifest.yaml")).text();
+    const manifestVersion = /version:\s*(\S+)/.exec(manifestText)?.[1];
+    expect(manifestVersion).toBe("1.1.0");
+  });
+
+  test("reports already up to date when detached at the latest tag", async () => {
+    const repo = await createMockSkillRepo(env.root, { name: "PinnedCurrent", version: "2.0.0" });
+    git(repo.path, "tag", "v2.0.0");
+    await install({
+      arc: env.arc, host: env.host, db: env.db,
+      repoUrl: repo.url, yes: true, pinnedVersion: "2.0.0",
+    });
+
+    const installPath = getSkill(env.db, "PinnedCurrent")!.install_path;
+    expect(isDetached(installPath)).toBe(true);
+    const headBefore = git(installPath, "rev-parse", "HEAD");
+
+    // No newer tag on the origin → nothing to advance to.
+    const result = await upgradePackage(env.db, env.arc, env.host, "PinnedCurrent");
+    expect(result.success).toBe(true);
+    expect(result.oldVersion).toBe("2.0.0");
+    expect(result.newVersion).toBe("2.0.0"); // up-to-date, same UX as the pull path's no-op
+
+    // Checkout untouched: same commit, still detached at the tag.
+    expect(git(installPath, "rev-parse", "HEAD")).toBe(headBefore);
+    expect(isDetached(installPath)).toBe(true);
+    const row = env.db
+      .prepare("SELECT version FROM skills WHERE name = ?")
+      .get("PinnedCurrent") as { version: string };
+    expect(row.version).toBe("2.0.0");
+  });
+
+  test("branch-tracking install is unchanged — still upgrades via git pull", async () => {
+    // A plain (non-pinned) install stays on the cloned default branch. This is
+    // the path arc#272 must NOT change: it keeps fast-forward-pulling.
+    const repo = await createMockSkillRepo(env.root, { name: "BranchTracking", version: "1.0.0" });
+    await install({ arc: env.arc, host: env.host, db: env.db, repoUrl: repo.url, yes: true });
+
+    const installPath = getSkill(env.db, "BranchTracking")!.install_path;
+    expect(isDetached(installPath)).toBe(false); // on a branch, not a tag
+
+    // Advance the origin branch by a commit (no tag) — a branch-tracking pull
+    // must pick this up, exactly as before.
+    const manifestPath = join(repo.path, "arc-manifest.yaml");
+    const content = await Bun.file(manifestPath).text();
+    await writeFile(manifestPath, content.replace("version: 1.0.0", "version: 1.1.0"));
+    git(repo.path, "add", ".");
+    git(repo.path, "-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "bump 1.1.0");
+
+    const result = await upgradePackage(env.db, env.arc, env.host, "BranchTracking");
+    expect(result.success).toBe(true);
+    expect(result.oldVersion).toBe("1.0.0");
+    expect(result.newVersion).toBe("1.1.0");
+
+    // Still on a branch after the pull.
+    expect(isDetached(installPath)).toBe(false);
+    const row = env.db
+      .prepare("SELECT version FROM skills WHERE name = ?")
+      .get("BranchTracking") as { version: string };
+    expect(row.version).toBe("1.1.0");
+  });
+
+  test("never downgrades: detached ahead of all tags leaves the checkout untouched (PR #308 review)", async () => {
+    // The reviewer's edge on PR #308: HEAD detached somewhere that is NOT the
+    // max tag but is AHEAD of every tag — e.g. a hand-checked-out SHA, or the
+    // install's tag deleted afterwards. Pre-guard, advanceDetachedToLatestTag
+    // would check out the (older) max tag, leaving disk behind the DB while
+    // the downstream version compare reports "already up to date".
+    const repo = await createMockSkillRepo(env.root, { name: "PinnedAhead", version: "1.0.0" });
+    git(repo.path, "tag", "v1.0.0");
+    await install({
+      arc: env.arc, host: env.host, db: env.db,
+      repoUrl: repo.url, yes: true, pinnedVersion: "1.0.0",
+    });
+
+    // Advance the origin past the tag WITHOUT tagging (2.0.0 exists only as a
+    // branch commit), then hand-advance the clone onto that untagged SHA and
+    // record 2.0.0 in the DB — the "ahead of all tags" state.
+    await bumpAndTag(repo.path, "1.0.0", "2.0.0");
+    git(repo.path, "tag", "-d", "v2.0.0"); // bumpAndTag tags; delete → untagged head commit
+    const installPath = getSkill(env.db, "PinnedAhead")!.install_path;
+    git(installPath, "fetch", "origin");
+    git(installPath, "-c", "advice.detachedHead=false", "checkout", "origin/HEAD");
+    env.db.prepare("UPDATE skills SET version = ? WHERE name = ?").run("2.0.0", "PinnedAhead");
+    expect(isDetached(installPath)).toBe(true);
+    const headBefore = git(installPath, "rev-parse", "HEAD");
+
+    // Latest tag on the origin is v1.0.0 — OLDER than the recorded 2.0.0.
+    const result = await upgradePackage(env.db, env.arc, env.host, "PinnedAhead");
+    expect(result.success).toBe(true);
+
+    // The guard must return before any working-tree mutation: same commit,
+    // still detached, DB version unchanged — no silent downgrade.
+    expect(git(installPath, "rev-parse", "HEAD")).toBe(headBefore);
+    expect(isDetached(installPath)).toBe(true);
+    const row = env.db
+      .prepare("SELECT version FROM skills WHERE name = ?")
+      .get("PinnedAhead") as { version: string };
+    expect(row.version).toBe("2.0.0");
+  });
+});
+
 describe("formatCheckResults", () => {
   test("formats upgradable packages", () => {
     const output = formatCheckResults([
