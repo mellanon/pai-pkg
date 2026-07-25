@@ -183,6 +183,48 @@ describe("arc purge — scripts.purge hook", () => {
     // And the config dir was still deleted.
     expect(existsSync(join(env.root, ".config/metafactory/hooked"))).toBe(false);
   });
+
+  test("a multi-file purge hook can source a sibling lib/*.sh (arc#372)", async () => {
+    // Regression for arc#372: the snapshot copies the hook's whole scripts/
+    // subtree, so `source "$(dirname "$0")/lib/helper.sh"` resolves. Before the
+    // fix only the single hook file was copied → the source failed with
+    // "No such file or directory" and the hook exited 1.
+    const marker = join(env.root, "purge-sibling.marker");
+    const repo = await createMockSkillRepo(env.root, {
+      name: "MultiFileHook",
+      owns: { config: ["~/.config/metafactory/multifilehook"] },
+      scripts: {
+        purge: {
+          path: "./scripts/purge.sh",
+          // Resolve the sibling via `$(dirname "$0")` — the same pattern
+          // cortex#2338's real purge.sh uses. (No `${…}` so it doesn't collide
+          // with JS template interpolation.)
+          content:
+            `#!/bin/bash\nset -e\n` +
+            `source "$(cd "$(dirname "$0")" && pwd)/lib/helper.sh"\n` +
+            `write_marker "${marker}"\n`,
+        },
+      },
+      // The sibling helper the hook sources — must be snapshotted alongside it.
+      extraFiles: [
+        {
+          path: "scripts/lib/helper.sh",
+          content: `#!/bin/bash\nwrite_marker() { echo helped > "$1"; }\n`,
+        },
+      ],
+    });
+    await install({ arc: env.arc, host: env.host, db: env.db, repoUrl: repo.url, yes: true });
+    await mkdir(join(env.root, ".config/metafactory/multifilehook"), { recursive: true });
+
+    const result = await purge(env.db, env.arc, env.host, "MultiFileHook", { yes: true, home: env.root });
+
+    expect(result.success).toBe(true);
+    // The hook ran cleanly (would be "failed" if the source could not resolve).
+    expect(result.purgeScript).toBe("ran");
+    // The sibling-sourced function actually executed.
+    expect(existsSync(marker)).toBe(true);
+    expect((await Bun.file(marker).text()).trim()).toBe("helped");
+  });
 });
 
 describe("arc purge — secrets namespace", () => {

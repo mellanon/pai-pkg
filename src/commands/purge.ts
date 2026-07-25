@@ -16,6 +16,16 @@
  *   3. Delete owns.config + owns.state (glob-expanded, symlink-safe).
  *   4. Run scripts.purge (from the snapshot) — non-declarable cleanup like
  *      `systemctl --user disable --now 'cortex@*'`. Non-aborting.
+ *
+ *      CONTRACT (arc#372): the snapshot preserves the hook's OWN containing
+ *      directory subtree (the package's `scripts/` dir), not just the single
+ *      file, so a multi-file purge hook may `source` its own siblings — e.g.
+ *      `source "$(dirname "$0")/lib/purge-supervision.sh"`. A hook may assume
+ *      only its own `scripts/` subtree is present at run time; anything it
+ *      references OUTSIDE that subtree is gone (remove() already deleted the
+ *      repo) and will fail — that boundary is intentional and unchanged. A hook
+ *      that sits at the repo ROOT (no containing subdir) gets ONLY itself
+ *      snapshotted; arc never copies the whole repo.
  *   5. Clear the package's `arc secrets` namespace.
  *   6. Name every owns.userData path as KEPT.
  *
@@ -23,10 +33,10 @@
  * render the confirmation preview). `--yes` runs non-interactively.
  */
 
-import { basename, join } from "path";
+import { basename, dirname, isAbsolute, join, normalize, sep } from "path";
 import { homedir, tmpdir, userInfo } from "os";
 import { existsSync } from "fs";
-import { mkdtemp, rm, writeFile, chmod, readFile } from "fs/promises";
+import { mkdtemp, rm, writeFile, chmod, readFile, cp } from "fs/promises";
 import type { Database } from "bun:sqlite";
 import type { ArcManifest, ArcPaths, HostAdapter, OwnsDeclaration } from "../types.js";
 import { getSkill } from "../lib/db.js";
@@ -211,7 +221,7 @@ export async function purge(
   if (scriptSnapshot) {
     const result = runScript({
       installPath: scriptSnapshot.dir,
-      scriptPath: scriptSnapshot.name,
+      scriptPath: scriptSnapshot.scriptRel,
       hookName: "purge",
       quiet: opts.quiet ?? opts.yes,
     });
@@ -283,23 +293,66 @@ function purgeScriptState(manifest: ArcManifest | null, installPath: string): Pu
 }
 
 /**
- * Copy scripts.purge to a temp dir so it survives remove() deleting the repo.
- * Returns null when no purge script is declared or the file is missing.
+ * Snapshot scripts.purge to a temp dir so it survives remove() deleting the
+ * repo (arc#359, arc#372). Returns null when no purge script is declared or the
+ * file is missing.
+ *
+ * arc#372: we copy the hook's CONTAINING directory subtree (the package's
+ * `scripts/` dir) — preserving the hook's relative layout — so a multi-file
+ * purge hook can `source` its own siblings (e.g. `lib/purge-supervision.sh`).
+ * `runScript` runs `bash <dir>/<scriptRel>` with `cwd = <dir>`, mirroring the
+ * repo-root-as-cwd contract every other lifecycle hook runs under, so a hook
+ * that resolves siblings via `$(dirname "$0")/…` finds them.
+ *
+ * Bounded on purpose:
+ *  - The copy is the hook's containing dir subtree, NOT the whole repo. A hook
+ *    whose declared path sits at the repo root (`dirname` is `.`) — or resolves
+ *    to an absolute / repo-escaping path — falls back to a single-file copy;
+ *    arc never snapshots the entire repo.
+ *  - Symlinks inside the subtree are copied as symlinks (not dereferenced), so
+ *    a link that points OUTSIDE the subtree dangles once remove() deletes the
+ *    repo — preserving the "references beyond its own scripts dir still fail"
+ *    boundary.
+ *
+ * `scriptRel` is the hook path RELATIVE to the returned `dir` (e.g.
+ * `scripts/purge.sh`, or just `purge.sh` on the root/fallback path).
  */
 async function snapshotPurgeScript(
   manifest: ArcManifest | null,
   installPath: string,
-): Promise<{ dir: string; name: string } | null> {
+): Promise<{ dir: string; scriptRel: string } | null> {
   const rel = manifest?.scripts?.purge;
   if (!rel) return null;
   const src = join(installPath, rel);
   if (!existsSync(src)) return null;
+
   const dir = await mkdtemp(join(tmpdir(), "arc-purge-"));
-  const name = basename(rel);
-  const dest = join(dir, name);
-  await writeFile(dest, await readFile(src));
-  await chmod(dest, 0o755).catch(() => {/* best-effort cleanup; nothing to recover */});
-  return { dir, name };
+
+  // The hook's containing directory, relative to the repo root. `normalize`
+  // strips a leading `./` so `./scripts/purge.sh` → `scripts/purge.sh`.
+  const relNorm = normalize(rel);
+  const scriptDirRel = dirname(relNorm);
+
+  // Root-level or escaping hook: snapshot ONLY the single file. Never copy the
+  // whole repo, and never reach outside it.
+  const isRepoRoot = scriptDirRel === "." || scriptDirRel === "";
+  const escapes =
+    isAbsolute(relNorm) || relNorm === ".." || relNorm.startsWith(".." + sep);
+  if (isRepoRoot || escapes) {
+    const name = basename(relNorm);
+    const dest = join(dir, name);
+    await writeFile(dest, await readFile(src));
+    await chmod(dest, 0o755).catch(() => {/* best-effort; a non-exec bit only affects bash-invoked hooks, which we run via `bash <path>` regardless */});
+    return { dir, scriptRel: name };
+  }
+
+  // Copy the hook's containing subtree, preserving relative layout. `cp` with
+  // recursive keeps symlinks verbatim (dereference defaults to false).
+  const srcDir = join(installPath, scriptDirRel);
+  const destDir = join(dir, scriptDirRel);
+  await cp(srcDir, destDir, { recursive: true });
+  await chmod(join(dir, relNorm), 0o755).catch(() => {/* best-effort; see above */});
+  return { dir, scriptRel: relNorm };
 }
 
 /**
