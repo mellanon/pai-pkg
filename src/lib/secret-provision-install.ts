@@ -109,6 +109,19 @@ export async function installTimeProvisionSecrets(
     backendChoice: opts.backendChoice,
   });
 
+  // arc#358: announce the storage mechanism BEFORE the first prompt so the
+  // questionnaire is not opaque — the operator should know these values are
+  // stored via `arc secrets <pkg>`, that any can be skipped, and that they can
+  // be added later. Only on the interactive prompt path (`--from-env` /
+  // `--skip-secrets` don't prompt, and `quiet` suppresses install chatter).
+  if (!opts.quiet && !opts.skipSecrets && !opts.fromEnv) {
+    console.log(
+      `\nThis package will now ask for its secrets, stored via \`arc secrets ${manifest.name}\`. ` +
+        `Press Return to skip any you don't have — you can add them later with ` +
+        `\`arc secrets set ${manifest.name} <name>\`.`,
+    );
+  }
+
   try {
     const result = await provisionSecrets(manifest, {
       agent: manifest.name,
@@ -123,17 +136,37 @@ export async function installTimeProvisionSecrets(
     // An OPTIONAL declared secret that goes unprovisioned is expected, not a
     // gap — it must never fail install AND must not raise the loud "will fail
     // at first use" warning (arc#363). Only REQUIRED skips warn.
+    const declaredByName = new Map(declared.map((d) => [d.name, d] as const));
     const optionalNames = new Set(declared.filter((d) => d.optional).map((d) => d.name));
     const requiredSkipped = result.skipped.filter((name) => !optionalNames.has(name));
+    const optionalSkippedCount = result.skipped.filter((name) => optionalNames.has(name)).length;
 
     if (!opts.quiet && requiredSkipped.length > 0) {
-      // NAMES only. Loud, not silent — the operator must know the daemon will
-      // fail at first use until these are provisioned.
-      console.warn(
-        `  ⚠ Secrets not provisioned for '${manifest.name}': ${requiredSkipped.join(", ")}. ` +
-          `The agent will fail at first use until you run ` +
-          `\`arc secrets set ${manifest.name} <secret>\`.`,
-      );
+      // arc#358: the old warning was a bare comma-joined name list with zero
+      // context. Give each unmet secret its own line with a purpose (the
+      // manifest's declared `reason`) and a needed-now marker, plus the storage
+      // mechanism (matching the pre-prompt banner) so a solo/MVP operator can
+      // act. Loud, not silent — these DO fail at first use.
+      //
+      // OPTIONAL skips are NEVER named here (arc#363 — they don't fail at first
+      // use); we only note HOW MANY were skipped so the operator sees at a
+      // glance that the rest are safe to leave unset. NAMES only, never values.
+      const lines: string[] = [
+        `  ⚠ ${manifest.name}: ${requiredSkipped.length} secret(s) needed now are not set — ` +
+          `the agent will fail at first use until you set them.`,
+        `    Stored via \`arc secrets\`; add any later with \`arc secrets set ${manifest.name} <name>\`.`,
+      ];
+      for (const name of requiredSkipped) {
+        const reason = declaredByName.get(name)?.reason;
+        lines.push(`    • ${name} [needed now]${reason ? ` — ${reason}` : ""}`);
+      }
+      if (optionalSkippedCount > 0) {
+        lines.push(
+          `    (${optionalSkippedCount} optional secret(s) also unset — safe to leave; ` +
+            `add later if you use those features.)`,
+        );
+      }
+      console.warn(lines.join("\n"));
     }
 
     return { success: true, stored: result.stored, skipped: result.skipped };

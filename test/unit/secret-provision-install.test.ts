@@ -200,3 +200,112 @@ describe("object-form secrets (arc#363)", () => {
     expect(joined).not.toContain("LLAMA_CLOUD_API_KEY");
   });
 });
+
+// ── arc#358: questionnaire clarity — banner + explanatory warning ──────────
+describe("secrets questionnaire clarity (arc#358)", () => {
+  function objManifest(
+    secrets: (string | { name: string; reason?: string; optional?: boolean })[],
+  ): ArcManifest {
+    return {
+      name: "dev",
+      version: "0.1.0",
+      type: "agent",
+      capabilities: {
+        filesystem: { read: [], write: [] },
+        network: [],
+        bash: { allowed: false },
+        secrets,
+      },
+    };
+  }
+
+  test("announces the storage mechanism BEFORE the first prompt", async () => {
+    const backend = new FileBackend(secretsRoot, "dev");
+    const logs: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => { logs.push(args.join(" ")); };
+    try {
+      await installTimeProvisionSecrets(manifest(["GITHUB_TOKEN"]), {
+        arc,
+        backend,
+        quiet: false,
+        // Interactive path (no --from-env / --skip-secrets); skip so the test
+        // never blocks on a real prompt.
+        prompt: async () => "",
+      });
+    } finally {
+      console.log = origLog;
+    }
+    const joined = logs.join("\n");
+    expect(joined).toContain("arc secrets dev");
+    expect(joined).toContain("arc secrets set dev <name>");
+    // The banner precedes any per-secret "✓ Secret stored" line.
+    expect(joined).toContain("skip");
+  });
+
+  test("no banner on the non-interactive --from-env path", async () => {
+    const backend = new FileBackend(secretsRoot, "dev");
+    const logs: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => { logs.push(args.join(" ")); };
+    try {
+      await installTimeProvisionSecrets(manifest(["GITHUB_TOKEN"]), {
+        arc,
+        backend,
+        fromEnv: true,
+        env: { GITHUB_TOKEN: "v" },
+        quiet: false,
+      });
+    } finally {
+      console.log = origLog;
+    }
+    expect(logs.join("\n")).not.toContain("arc secrets set dev");
+  });
+
+  test("warning carries a per-entry purpose + needed-now marker", async () => {
+    const backend = new FileBackend(secretsRoot, "dev");
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
+    try {
+      await installTimeProvisionSecrets(
+        objManifest([
+          { name: "GH_TOKEN", reason: "cloud deploy + gh sync" },
+          { name: "NATS_TOKEN", reason: "relay bus auth" },
+        ]),
+        { arc, backend, fromEnv: true, env: {}, quiet: false },
+      );
+    } finally {
+      console.warn = origWarn;
+    }
+    const joined = warnings.join("\n");
+    expect(joined).toContain("GH_TOKEN");
+    expect(joined).toContain("cloud deploy + gh sync");
+    expect(joined).toContain("NATS_TOKEN");
+    expect(joined).toContain("relay bus auth");
+    expect(joined).toContain("needed now");
+    expect(joined).toContain("arc secrets set dev <name>");
+  });
+
+  test("optional skips are counted, never named, in the warning", async () => {
+    const backend = new FileBackend(secretsRoot, "dev");
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
+    try {
+      await installTimeProvisionSecrets(
+        objManifest([
+          { name: "GH_TOKEN", reason: "cloud deploy" },
+          { name: "LLAMA_CLOUD_API_KEY", reason: "LlamaParse", optional: true },
+        ]),
+        { arc, backend, fromEnv: true, env: {}, quiet: false },
+      );
+    } finally {
+      console.warn = origWarn;
+    }
+    const joined = warnings.join("\n");
+    expect(joined).toContain("1 optional secret(s) also unset");
+    // The optional secret's NAME must never appear (arc#363 discipline).
+    expect(joined).not.toContain("LLAMA_CLOUD_API_KEY");
+  });
+});
