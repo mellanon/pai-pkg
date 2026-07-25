@@ -72,6 +72,7 @@ export const VALID_TYPES = [
   "rules",
   "library",
   "action",
+  "governance",
 ] as const;
 
 /** Trust tiers strict mode accepts (issue #317 adds `core` over spec §4.1). */

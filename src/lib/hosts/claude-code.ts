@@ -36,6 +36,7 @@ export function createClaudeCodeHost(opts?: { root?: string }): HostAdapter {
       type === "tool" ||
       type === "component" ||
       type === "rules" ||
+      type === "governance" ||
       type === "library",
   };
 }

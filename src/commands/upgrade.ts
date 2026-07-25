@@ -459,7 +459,7 @@ export async function upgradePackage(
     // regenerate them (template content may have changed even if the version
     // was already bumped). Keyed off `provides.templates`, NOT `type`: any
     // package that declares templates (e.g. type:rules OR
-    // type:governance-overlay like compass) regenerates them in its consumers
+    // type:governance like compass) regenerates them in its consumers
     // (arc#203).
     if (manifest.provides?.templates?.length) {
       const consumerDirs = findConsumerRepos(manifest.provides.templates);
@@ -495,8 +495,15 @@ export async function upgradePackage(
     }
   }
 
-  // Re-symlink component files if this is a component
-  if (manifest.type === "component" && manifest.provides?.files?.length) {
+  // Re-symlink provides.files drops for types whose payload is provides.files.
+  // component: no per-type primary layout. governance (arc#361): the ENTIRE
+  // install payload is provides.files — without this re-drop, a governance
+  // package that adds or moves a drop between versions never lands it on
+  // upgrade.
+  if (
+    (manifest.type === "component" || manifest.type === "governance") &&
+    manifest.provides?.files?.length
+  ) {
     for (const file of manifest.provides.files) {
       const sourcePath = join(installPath, file.source);
       const targetPath = resolveProvidesTarget(file.target);
@@ -568,7 +575,7 @@ export async function upgradePackage(
 
   // Re-generate templates for any package that provides them.
   // Scan all repos with matching config files, not just cwd. Keyed off
-  // `provides.templates`, NOT `type`: type:rules AND type:governance-overlay
+  // `provides.templates`, NOT `type`: type:rules AND type:governance
   // (compass) both regenerate the templates they declare into consumers
   // (arc#203).
   if (manifest.provides?.templates?.length) {

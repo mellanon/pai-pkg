@@ -519,7 +519,9 @@ export async function completeInstallTransaction(
   }
 
   const now = new Date().toISOString();
-  const artifactType = manifest.type as ArtifactType;
+  // ArcManifest.type and ArtifactType are the same union since arc#361
+  // (governance + system folded into ArtifactType) — no assertion needed.
+  const artifactType: ArtifactType = manifest.type;
   const artifactSourceDir = resolveArtifactSourceDir(manifest.type, installPath);
   recordInstall(
     db,

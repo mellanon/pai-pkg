@@ -13,7 +13,7 @@ import {
 import { saveSources } from "../../src/lib/sources.js";
 import { getSkill } from "../../src/lib/db.js";
 import { mkdir, readFile, rm, writeFile } from "fs/promises";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, lstatSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import YAML from "yaml";
 import type { RegistryConfig, SourcesConfig } from "../../src/types.js";
@@ -663,9 +663,11 @@ describe("arc#184 — extracted-tarball upgrade and check", () => {
 
 // ---------------------------------------------------------------------------
 // arc#203 — template regen is keyed off provides.templates, NOT type:rules.
-// A governance-overlay package (compass) that declares provides.templates must
+// A governance package (compass) that declares provides.templates must
 // regenerate its consumers' CLAUDE.md on upgrade, exactly like a type:rules
-// package would.
+// package would. (Spelling: `governance` is canonical per arc#361. One fixture
+// below deliberately keeps the retired off-union `governance-overlay` string —
+// compass proper's live on-disk state — to guard the unknown-type regen path.)
 // ---------------------------------------------------------------------------
 
 /**
@@ -712,23 +714,27 @@ async function createMockTemplateRepo(
 }
 
 /**
- * Flip the on-disk manifest `type` to `governance-overlay` and commit, mirroring
- * the LIVE compass scenario: compass was installed while it was `type: rules`
- * (the DB still records artifact_type:rules), then its manifest later changed to
- * `type: governance-overlay`. upgradePackage re-reads the manifest from disk, so
- * the regen guard sees `governance-overlay`. This is the exact condition arc#203
- * fixes — the installer's own type dispatch (which doesn't yet accept
- * governance-overlay) is a separate concern outside this regen path.
+ * Flip the on-disk manifest `type` and commit, mirroring the LIVE compass
+ * scenario: compass was installed while it was `type: rules` (the DB still
+ * records artifact_type:rules), then its manifest later changed on disk.
+ * upgradePackage re-reads the manifest from disk, so the regen guard sees the
+ * flipped type. This is the exact condition arc#203 fixed — regen keys off
+ * provides.templates, not the recorded (or even a recognized) type.
+ *
+ * Callers use both the canonical `governance` spelling (arc#361) AND the
+ * retired off-union `governance-overlay` string — the latter is compass
+ * proper's live on-disk state until its spelling follow-up lands, so the
+ * unknown-type regen path must stay guarded.
  */
-function flipManifestTypeToGovernanceOverlay(repoPath: string): void {
+function flipManifestType(repoPath: string, type: string): void {
   const manifestPath = join(repoPath, "arc-manifest.yaml");
   const raw = readFileSync(manifestPath, "utf-8");
   const parsed = YAML.parse(raw);
-  parsed.type = "governance-overlay";
+  parsed.type = type;
   writeFileSync(manifestPath, YAML.stringify(parsed));
   Bun.spawnSync(["git", "add", "."], { cwd: repoPath, stdout: "pipe", stderr: "pipe" });
   Bun.spawnSync(
-    ["git", "-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "flip to governance-overlay"],
+    ["git", "-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", `flip to ${type}`],
     { cwd: repoPath, stdout: "pipe", stderr: "pipe" },
   );
 }
@@ -760,8 +766,8 @@ async function withConsumerSandbox<T>(
   }
 }
 
-describe("upgradePackage — template regen for governance-overlay (arc#203)", () => {
-  test("a governance-overlay package with provides.templates regenerates a consumer's CLAUDE.md on force-upgrade", async () => {
+describe("upgradePackage — template regen for governance (arc#203)", () => {
+  test("a governance package with provides.templates regenerates a consumer's CLAUDE.md on force-upgrade", async () => {
     // A consumer repo (sibling under the dev root) that opts into the template
     // via agents-md.yaml. withConsumerSandbox pins findConsumerRepos to this dir.
     const devRoot = join(env.root, "dev-root");
@@ -773,7 +779,7 @@ describe("upgradePackage — template regen for governance-overlay (arc#203)", (
     );
 
     // Install while the package is type:rules (compass's original DB state),
-    // then flip the live manifest to type:governance-overlay before upgrade —
+    // then flip the live manifest to type:governance before upgrade —
     // reproducing the exact live drift behind arc#203.
     const repo = await createMockTemplateRepo(env.root, {
       name: "OverlayPkg",
@@ -784,7 +790,7 @@ describe("upgradePackage — template regen for governance-overlay (arc#203)", (
     // Pass consumerDir so the install-time rules render targets the sandbox
     // consumer (default would be process.cwd() = the running repo).
     await install({ arc: env.arc, host: env.host, db: env.db, repoUrl: repo.url, yes: true, consumerDir });
-    flipManifestTypeToGovernanceOverlay(repo.path);
+    flipManifestType(repo.path, "governance");
 
     // Prove the upgrade — not the install — is what regenerates: clear the
     // install-time render, then assert the upgrade rebuilds it.
@@ -793,7 +799,7 @@ describe("upgradePackage — template regen for governance-overlay (arc#203)", (
 
     await withConsumerSandbox(devRoot, consumerDir, async () => {
       // force-upgrade re-runs the pipeline; the regen must fire despite the
-      // package being governance-overlay (not type:rules) — this is the arc#203 fix.
+      // package being governance (not type:rules) — this is the arc#203 fix.
       const result = await upgradePackage(env.db, env.arc, env.host, "OverlayPkg", { force: true });
       expect(result.success).toBe(true);
     });
@@ -806,7 +812,7 @@ describe("upgradePackage — template regen for governance-overlay (arc#203)", (
     expect(body).toContain("# Consumer"); // placeholder substitution ran
   });
 
-  test("same-version (non-force) upgrade still regenerates templates for a governance-overlay package", async () => {
+  test("same-version (non-force) upgrade still regenerates templates for an off-union on-disk type (governance-overlay — compass proper's live state)", async () => {
     const devRoot = join(env.root, "dev-root-2");
     const consumerDir = join(devRoot, "consumer-repo");
     await mkdir(consumerDir, { recursive: true });
@@ -822,12 +828,15 @@ describe("upgradePackage — template regen for governance-overlay (arc#203)", (
       templateBody: "# {PROJECT_NAME}\n\nSAME-VERSION-ROW: regen on matching version.\n",
     });
     await install({ arc: env.arc, host: env.host, db: env.db, repoUrl: repo.url, yes: true, consumerDir });
-    flipManifestTypeToGovernanceOverlay(repo.path);
+    // Deliberately OFF-UNION: compass proper's on-disk manifest still says
+    // `governance-overlay` until its spelling follow-up lands. Regen keys off
+    // provides.templates, so even an unrecognized type string must regenerate.
+    flipManifestType(repo.path, "governance-overlay");
     await rm(join(consumerDir, "CLAUDE.md"), { force: true });
 
     await withConsumerSandbox(devRoot, consumerDir, async () => {
       // No force, no newer version: hits the same-version short-circuit branch
-      // (upgrade.ts ~L309), which must now regenerate for governance-overlay too.
+      // (upgrade.ts ~L309), which must regenerate regardless of type spelling.
       const result = await upgradePackage(env.db, env.arc, env.host, "OverlayPkg2");
       expect(result.success).toBe(true);
     });
@@ -836,6 +845,95 @@ describe("upgradePackage — template regen for governance-overlay (arc#203)", (
     expect(existsSync(generated)).toBe(true);
     const body = await Bun.file(generated).text();
     expect(body).toContain("SAME-VERSION-ROW: regen on matching version.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// arc#361 — provides.files re-drop on upgrade for type:governance. governance
+// is the first type whose ENTIRE install payload is provides.files (no primary
+// per-type symlink), so upgrade must re-drop declared files exactly like it
+// does for type:component — otherwise a new/moved drop between versions never
+// lands on upgrade.
+// ---------------------------------------------------------------------------
+
+/** Build + git-commit a governance package whose payload is provides.files. */
+async function createMockGovernanceFilesRepo(
+  root: string,
+  opts: {
+    name: string;
+    version: string;
+    files: { source: string; target: string; content: string }[];
+  },
+): Promise<{ path: string; url: string }> {
+  const repoDir = join(root, `mock-${opts.name}`);
+  await mkdir(repoDir, { recursive: true });
+  for (const f of opts.files) {
+    await mkdir(join(repoDir, f.source, ".."), { recursive: true });
+    await writeFile(join(repoDir, f.source), f.content);
+  }
+  await writeFile(
+    join(repoDir, "arc-manifest.yaml"),
+    YAML.stringify({
+      name: opts.name,
+      version: opts.version,
+      type: "governance",
+      tier: "custom",
+      author: { name: "tester", github: "tester" },
+      provides: { files: opts.files.map((f) => ({ source: f.source, target: f.target })) },
+      depends_on: { tools: [{ name: "bun", version: ">=1.0.0" }] },
+      capabilities: {
+        filesystem: { read: [], write: [] },
+        network: [],
+        bash: { allowed: false },
+        secrets: [],
+      },
+    }),
+  );
+  Bun.spawnSync(["git", "init"], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+  Bun.spawnSync(["git", "add", "."], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+  Bun.spawnSync(
+    ["git", "-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "Initial commit"],
+    { cwd: repoDir, stdout: "pipe", stderr: "pipe" },
+  );
+  return { path: repoDir, url: repoDir };
+}
+
+describe("upgradePackage — provides.files re-drop for governance (arc#361)", () => {
+  test("a drop added in a new version lands on upgrade", async () => {
+    const targetA = join(env.root, "fake-home", "drop-a.md");
+    const targetB = join(env.root, "fake-home", "drop-b.md");
+
+    const repo = await createMockGovernanceFilesRepo(env.root, {
+      name: "GovFiles",
+      version: "1.0.0",
+      files: [{ source: "files/drop-a.md", target: targetA, content: "drop A\n" }],
+    });
+    await install({ arc: env.arc, host: env.host, db: env.db, repoUrl: repo.url, yes: true });
+    expect(lstatSync(targetA).isSymbolicLink()).toBe(true);
+    expect(existsSync(targetB)).toBe(false);
+
+    // v1.1.0 declares a SECOND drop (the compass-core "adds/moves a file
+    // between versions" scenario).
+    await writeFile(join(repo.path, "files", "drop-b.md"), "drop B\n");
+    const manifestPath = join(repo.path, "arc-manifest.yaml");
+    const parsed = YAML.parse(readFileSync(manifestPath, "utf-8"));
+    parsed.version = "1.1.0";
+    parsed.provides.files.push({ source: "files/drop-b.md", target: targetB });
+    writeFileSync(manifestPath, YAML.stringify(parsed));
+    Bun.spawnSync(["git", "add", "."], { cwd: repo.path, stdout: "pipe", stderr: "pipe" });
+    Bun.spawnSync(
+      ["git", "-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "v1.1.0 adds drop-b"],
+      { cwd: repo.path, stdout: "pipe", stderr: "pipe" },
+    );
+
+    const result = await upgradePackage(env.db, env.arc, env.host, "GovFiles");
+    expect(result.success).toBe(true);
+    expect(result.newVersion).toBe("1.1.0");
+
+    // The NEW drop landed on upgrade — this is the arc#361 re-drop branch
+    // (previously component-only). The original drop is still live.
+    expect(lstatSync(targetB).isSymbolicLink()).toBe(true);
+    expect(lstatSync(targetA).isSymbolicLink()).toBe(true);
   });
 });
 
