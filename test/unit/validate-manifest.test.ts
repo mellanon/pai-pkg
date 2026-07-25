@@ -320,15 +320,18 @@ describe("secrets entry shape (bare NAME | { name, reason?, optional? } — arc#
   });
 });
 
-describe("namespace rule (optional; ^@[a-z0-9-]+$)", () => {
-  test("pass: valid @scope", () => {
-    expect(hasField(validateStrictManifest(withManifest({ namespace: "@metafactory" })), "namespace")).toBe(false);
+describe("namespace rule (optional; BARE scope ^[a-z0-9-]+$ — arc#369)", () => {
+  test("pass: bare scope", () => {
+    expect(hasField(validateStrictManifest(withManifest({ namespace: "metafactory" })), "namespace")).toBe(false);
   });
-  test("fail: missing @ prefix", () => {
-    expect(hasField(validateStrictManifest(withManifest({ namespace: "metafactory" })), "namespace")).toBe(true);
+  // arc#369: the sigil belongs to the wire/display form, not the manifest field.
+  // publish.ts prepends it (`@${scope}`), so a manifest carrying it publishes to
+  // `%40%40scope`. Requiring it here made a valid manifest un-publishable.
+  test("fail: @-prefixed scope (would double-prefix at publish)", () => {
+    expect(hasField(validateStrictManifest(withManifest({ namespace: "@metafactory" })), "namespace")).toBe(true);
   });
   test("fail: uppercase in scope", () => {
-    expect(hasField(validateStrictManifest(withManifest({ namespace: "@Meta" })), "namespace")).toBe(true);
+    expect(hasField(validateStrictManifest(withManifest({ namespace: "Meta" })), "namespace")).toBe(true);
   });
 });
 
