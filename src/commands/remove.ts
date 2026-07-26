@@ -1,5 +1,6 @@
-import { join } from "path";
+import { join, relative, isAbsolute } from "path";
 import { existsSync } from "fs";
+import { homedir } from "os";
 import { rm, lstat, readlink, unlink } from "fs/promises";
 import type { Database } from "bun:sqlite";
 import type {
@@ -9,7 +10,7 @@ import type {
   HostId,
   OwnsDeclaration,
 } from "../types.js";
-import { hasOwns, purgeableEntries } from "../lib/owns.js";
+import { hasOwns, purgeableEntries, expandOwnsEntry, pathLiveness } from "../lib/owns.js";
 import { getSkill, removeSkill, listByLibrary, listSkills } from "../lib/db.js";
 import { removeSymlink, removeCliShim, extractAllCliInfo } from "../lib/symlinks.js";
 import { resolveProvidesTarget } from "../lib/provides-target.js";
@@ -715,34 +716,84 @@ export async function remove(
 }
 
 /**
- * The post-remove "kept config/state" summary lines (arc#359, arc#373 defect A).
+ * The post-remove "kept config/state" summary lines (arc#359, arc#373 defect A,
+ * cortex#2441 Note 2).
  *
- * BUG THIS FIXES: the previous summary ended with `run: arc purge <name>` — a
- * next step that is IMPOSSIBLE precisely because remove just ran. `arc purge`
+ * BUG (arc#373 defect A): the earliest summary ended with `run: arc purge <name>`
+ * — a next step that is IMPOSSIBLE precisely because remove just ran. `arc purge`
  * REQUIRES the package still installed: the manifest is its only source of the
  * `owns` declaration (arc#359), and remove has already deleted the repo/manifest,
- * so post-remove `arc purge <name>` always fails with "not installed". The
- * summary pointed at a command that cannot succeed.
+ * so post-remove `arc purge <name>` always fails with "not installed".
  *
- * This formatter never names a command that fails after remove. It:
- *  - Names the config/state paths arc left on disk, so a manual sweep is possible
- *    RIGHT NOW (the only in-the-moment action, since arc keeps no post-remove
- *    state to purge from).
- *  - Points at `arc remove --purge <name>` as the one-shot to use INSTEAD of a
- *    bare remove next time — purge runs WITH remove, while the manifest is still
- *    present, never after it.
+ * BUG (cortex#2441 Note 2): the summary then named the RAW owns config/state
+ * declarations regardless of on-disk existence. `owns` describes what the
+ * package's own RUNTIME may write — but on an install where a stack was never
+ * stood up, those paths (`~/.config/metafactory/cortex`, …) never got created.
+ * Naming an absent declaration as "kept on disk" is misleading. Field report:
+ * `arc install cortex` + `arc remove cortex` printed
+ * `kept (config/state): ~/.config/metafactory/cortex, …` for a path that quickstart
+ * (not `arc install`) creates, so it did not exist.
+ *
+ * This formatter now names ONLY paths that actually exist on disk:
+ *  - Each purgeable (config/state) owns entry is glob-expanded (rooted at `home`),
+ *    and every expansion is filtered by real on-disk presence — a literal entry
+ *    that doesn't exist, or a glob that matches nothing, contributes nothing.
+ *  - Matches are displayed in `~/…` form (re-tilde'd against `home`) so the output
+ *    reads the same as the declaration, and de-duplicated (two entries can expand
+ *    to the same path).
+ *  - When NOTHING is on disk, prints one clean "nothing kept" line and NO
+ *    `--purge` suggestion (there is nothing for purge to drop).
+ *  - Otherwise points at `arc remove --purge <name>` as the one-shot to use
+ *    INSTEAD of a bare remove next time — purge runs WITH remove, while the
+ *    manifest is still present, never after it.
  *
  * Returns [] when the package declared no purgeable (config/state) owns entries,
  * so a userData-only declaration (never deleted) prints no purge guidance.
+ *
+ * `home` is injectable for tests; production callers use the default (real home).
+ * It does NOT change what purge DELETES — only what this summary DISPLAYS.
  */
-export function formatRemoveKeptSummary(result: RemoveResult): string[] {
+export function formatRemoveKeptSummary(
+  result: RemoveResult,
+  home: string = homedir(),
+): string[] {
   if (!hasOwns(result.owns)) return [];
-  const entries = purgeableEntries(result.owns);
-  if (entries.length === 0) return [];
+  const declared = purgeableEntries(result.owns);
+  if (declared.length === 0) return [];
+
+  // Existence filter (cortex#2441 Note 2): expand each declared config/state
+  // entry glob-aware, keep only expansions that are present on disk.
+  const present: string[] = [];
+  for (const entry of declared) {
+    for (const abs of expandOwnsEntry(entry, home)) {
+      if (pathLiveness(abs) === "present") present.push(abs);
+    }
+  }
+  const kept = [...new Set(present)].sort().map((abs) => toTildePath(abs, home));
+
+  if (kept.length === 0) {
+    // Nothing the package's runtime wrote is on disk — say so cleanly and do
+    // NOT suggest `--purge`: there is nothing for it to drop.
+    return [`   ↳ nothing kept — no config/state on disk for ${result.name}`];
+  }
+
   return [
-    `   ↳ kept on disk (runtime config/state arc did not install): ${entries.join(", ")}`,
+    `   ↳ kept on disk (runtime config/state arc did not install): ${kept.join(", ")}`,
     `      delete these manually, or next time run \`arc remove --purge ${result.name}\` to drop them as part of removal`,
   ];
+}
+
+/**
+ * Render an absolute path under `home` back to `~/…` display form (matching how
+ * owns entries are declared). A path not under `home` is returned unchanged —
+ * expandOwnsEntry only ever yields under-home paths, so that branch is defensive.
+ */
+function toTildePath(abs: string, home: string): string {
+  const rel = relative(home, abs);
+  if (rel.length > 0 && !rel.startsWith("..") && !isAbsolute(rel)) {
+    return `~/${rel}`;
+  }
+  return abs;
 }
 
 /**
