@@ -806,7 +806,24 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
       installTx = handle;
     },
   });
-  if (!transactionResult.success) return transactionResult;
+  if (!transactionResult.success) {
+    // arc#373 defect B: a failed postinstall (or node-deps / missing-hook gate)
+    // makes completeInstallTransaction run its rollback of symlinks/hooks/
+    // launchd — but the cloned repo is NOT part of that rollback, and the DB row
+    // is committed only AFTER postinstall succeeds. So a failed postinstall left
+    // an orphaned clone with no DB row: `arc remove <pkg>` couldn't find it and
+    // the tester had to `rm` the clone by hand. Roll the clone back here to match
+    // every other failure exit in this function (git-clone, manifest-read,
+    // secret-env). Guarded on !preExtractedPath: a registry install's extracted
+    // dir is owned by the registry pipeline's own cleanup, and a shared-library
+    // clone is never installed through this single-package path.
+    if (!opts.preExtractedPath) {
+      await rm(installPath, { recursive: true, force: true }).catch(() => {
+        /* best-effort; the clone may already be gone */
+      });
+    }
+    return transactionResult;
+  }
 
   // F-6b (arc#228) — IDENTITY STEP. For type:agent packages, provision the
   // agent's NKey seed + DID and scaffold its instance state. Best-effort and
@@ -841,6 +858,15 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
     // remove the row itself to leave nothing behind.
     const evidence = installTx ? await installTx.rollback() : transactionResult.evidence;
     removeSkill(db, manifest.name);
+    // arc#373 defect B (sibling exit): the DB row is torn down above, so without
+    // this the clone would be orphaned with no way for `arc remove` to find it —
+    // same un-removable state a failed postinstall used to leave. Roll the clone
+    // back too, guarded on !preExtractedPath like the transaction-failure exit.
+    if (!opts.preExtractedPath) {
+      await rm(installPath, { recursive: true, force: true }).catch(() => {
+        /* best-effort; the clone may already be gone */
+      });
+    }
     return {
       success: false,
       name: manifest.name,
