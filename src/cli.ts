@@ -22,10 +22,9 @@ import { info, formatInfo, formatInfoJson } from "./commands/info.js";
 import { audit, formatAudit } from "./commands/audit.js";
 import { disable } from "./commands/disable.js";
 import { enable } from "./commands/enable.js";
-import { remove, removeLibrary } from "./commands/remove.js";
+import { remove, removeLibrary, formatRemoveKeptSummary } from "./commands/remove.js";
 import { purge, formatPurge } from "./commands/purge.js";
 import { filesListing, formatFiles, formatFilesJson } from "./commands/files.js";
-import { hasOwns, purgeableEntries } from "./lib/owns.js";
 import { verify, formatVerify } from "./commands/verify.js";
 import { init, resolveInitTarget } from "./commands/init.js";
 import { upgradeCore, formatUpgrade } from "./commands/upgrade-core.js";
@@ -612,11 +611,34 @@ program
     "--keep-deps",
     "Do not cascade removal to exclusively-owned depends_on.packages (arc#348)",
   )
-  .action(async (name: string, opts: { library?: string; yes?: boolean; keepDeps?: boolean }) => {
+  .option(
+    "--purge",
+    "Also delete the runtime config/state the package declares it owns — runs `arc purge` inline, while the manifest is still on disk (arc#373)",
+  )
+  .action(async (name: string, opts: { library?: string; yes?: boolean; keepDeps?: boolean; purge?: boolean }) => {
     const paths = createArcPaths();
     const db = openDatabase(paths.dbPath);
     const host = getDefaultHost();
     const removeOpts = { yes: opts.yes, keepDeps: opts.keepDeps };
+
+    // arc#373 defect A: `--purge` does remove + owns config/state deletion in ONE
+    // shot, while the manifest is still present. This is the actionable form of
+    // the old post-remove `arc purge` suggestion (which failed because remove had
+    // already deleted the manifest purge needs). Delegate straight to the shared
+    // purge flow; purge() internally reuses remove(), so all teardown still runs.
+    if (opts.purge) {
+      if (opts.library) {
+        console.error("❌ --purge cannot be combined with --library; purge one package at a time by name");
+        db.close();
+        process.exit(1);
+      }
+      const libRef = parseLibraryRef(name);
+      const purgeName = libRef?.artifactName ?? name;
+      const ok = await runPurgeFlow(db, paths, host, purgeName, { yes: opts.yes, keepDeps: opts.keepDeps });
+      db.close();
+      if (!ok) process.exit(1);
+      return;
+    }
 
     if (opts.library) {
       // Remove all artifacts from a library
@@ -655,14 +677,13 @@ program
             `   ↳ kept dependency ${kept.name} (still required by: ${kept.requiredBy.join(", ")})`,
           );
         }
-        // arc#359: name the runtime-created config/state remove leaves behind,
-        // and the purge command that clears it.
-        if (hasOwns(result.owns)) {
-          const entries = purgeableEntries(result.owns);
-          if (entries.length > 0) {
-            console.log(`   ↳ kept (config/state): ${entries.join(", ")}`);
-          }
-          console.log(`   run: arc purge ${result.name}   # to also delete the above`);
+        // arc#359 + arc#373 defect A: name the runtime config/state remove
+        // leaves on disk and point at an actionable next step. The formatter
+        // never suggests a command that fails post-remove (the old `arc purge
+        // <name>` errored "not installed" because remove had deleted the
+        // manifest purge needs).
+        for (const line of formatRemoveKeptSummary(result)) {
+          console.log(line);
         }
       } else {
         // Artifact not found — check if name matches a library
@@ -695,6 +716,49 @@ async function confirmPrompt(question: string): Promise<boolean> {
   });
 }
 
+/**
+ * Shared purge flow (preview → confirm → execute) used by BOTH `arc purge` and
+ * `arc remove --purge` (arc#373). Prints the plan and the final report; returns
+ * true on success (including a clean abort at the confirm prompt — nothing to
+ * do), false on a not-installed error or a failed purge. Does NOT close `db` —
+ * the caller owns the connection lifecycle. The purge command handles its own
+ * `--dry-run` before calling this (that path mutates nothing).
+ */
+async function runPurgeFlow(
+  db: ReturnType<typeof openDatabase>,
+  paths: ReturnType<typeof createArcPaths>,
+  host: ReturnType<typeof getDefaultHost>,
+  name: string,
+  opts: { yes?: boolean; keepDeps?: boolean },
+): Promise<boolean> {
+  // Preview first (dry run mutates nothing) so we can both surface a not-
+  // installed error early AND render the confirmation plan.
+  const preview = await purge(db, paths, host, name, {
+    dryRun: true,
+    keepDeps: opts.keepDeps,
+  });
+  if (!preview.success) {
+    console.error(`❌ ${preview.error}`);
+    return false;
+  }
+
+  if (!opts.yes) {
+    console.log(formatPurge(preview));
+    const ok = await confirmPrompt(`\nProceed with purge of '${name}'? [y/N] `);
+    if (!ok) {
+      console.log("Aborted; nothing deleted.");
+      return true;
+    }
+  }
+
+  const result = await purge(db, paths, host, name, {
+    yes: opts.yes,
+    keepDeps: opts.keepDeps,
+  });
+  console.log(formatPurge(result));
+  return result.success;
+}
+
 program
   .command("files <name>")
   .description("List every artifact an installed package put on disk, plus its owns declarations (dpkg -L)")
@@ -720,41 +784,27 @@ program
     const db = openDatabase(paths.dbPath);
     const host = getDefaultHost();
 
-    // Preview first (dry run mutates nothing) so we can both surface a not-
-    // installed error early AND render the confirmation plan.
-    const preview = await purge(db, paths, host, name, {
-      dryRun: true,
-      keepDeps: opts.keepDeps,
-    });
-    if (!preview.success) {
-      console.error(`❌ ${preview.error}`);
-      db.close();
-      process.exit(1);
-    }
-
+    // --dry-run is purge-command-specific: render the plan, mutate nothing.
     if (opts.dryRun) {
-      console.log(formatPurge(preview));
+      const preview = await purge(db, paths, host, name, {
+        dryRun: true,
+        keepDeps: opts.keepDeps,
+      });
       db.close();
+      if (!preview.success) {
+        console.error(`❌ ${preview.error}`);
+        process.exit(1);
+      }
+      console.log(formatPurge(preview));
       return;
     }
 
-    if (!opts.yes) {
-      console.log(formatPurge(preview));
-      const ok = await confirmPrompt(`\nProceed with purge of '${name}'? [y/N] `);
-      if (!ok) {
-        console.log("Aborted; nothing deleted.");
-        db.close();
-        return;
-      }
-    }
-
-    const result = await purge(db, paths, host, name, {
+    const ok = await runPurgeFlow(db, paths, host, name, {
       yes: opts.yes,
       keepDeps: opts.keepDeps,
     });
     db.close();
-    console.log(formatPurge(result));
-    if (!result.success) process.exit(1);
+    if (!ok) process.exit(1);
   });
 
 program

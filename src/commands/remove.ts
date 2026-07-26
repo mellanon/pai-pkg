@@ -9,7 +9,7 @@ import type {
   HostId,
   OwnsDeclaration,
 } from "../types.js";
-import { hasOwns } from "../lib/owns.js";
+import { hasOwns, purgeableEntries } from "../lib/owns.js";
 import { getSkill, removeSkill, listByLibrary, listSkills } from "../lib/db.js";
 import { removeSymlink, removeCliShim, extractAllCliInfo } from "../lib/symlinks.js";
 import { resolveProvidesTarget } from "../lib/provides-target.js";
@@ -712,6 +712,37 @@ export async function remove(
     name,
     ...(hasOwns(ownsDecl) ? { owns: ownsDecl } : {}),
   };
+}
+
+/**
+ * The post-remove "kept config/state" summary lines (arc#359, arc#373 defect A).
+ *
+ * BUG THIS FIXES: the previous summary ended with `run: arc purge <name>` — a
+ * next step that is IMPOSSIBLE precisely because remove just ran. `arc purge`
+ * REQUIRES the package still installed: the manifest is its only source of the
+ * `owns` declaration (arc#359), and remove has already deleted the repo/manifest,
+ * so post-remove `arc purge <name>` always fails with "not installed". The
+ * summary pointed at a command that cannot succeed.
+ *
+ * This formatter never names a command that fails after remove. It:
+ *  - Names the config/state paths arc left on disk, so a manual sweep is possible
+ *    RIGHT NOW (the only in-the-moment action, since arc keeps no post-remove
+ *    state to purge from).
+ *  - Points at `arc remove --purge <name>` as the one-shot to use INSTEAD of a
+ *    bare remove next time — purge runs WITH remove, while the manifest is still
+ *    present, never after it.
+ *
+ * Returns [] when the package declared no purgeable (config/state) owns entries,
+ * so a userData-only declaration (never deleted) prints no purge guidance.
+ */
+export function formatRemoveKeptSummary(result: RemoveResult): string[] {
+  if (!hasOwns(result.owns)) return [];
+  const entries = purgeableEntries(result.owns);
+  if (entries.length === 0) return [];
+  return [
+    `   ↳ kept on disk (runtime config/state arc did not install): ${entries.join(", ")}`,
+    `      delete these manually, or next time run \`arc remove --purge ${result.name}\` to drop them as part of removal`,
+  ];
 }
 
 /**
