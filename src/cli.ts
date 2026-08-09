@@ -7,6 +7,7 @@ import { openDatabase, getSkill } from "./lib/db.js";
 import { extractAllCliInfo } from "./lib/symlinks.js";
 import { install, parseNameVersion } from "./commands/install.js";
 import { buildCortexInstallSteering } from "./lib/hosts/cortex-config-split.js";
+import { isSafePinRef } from "./lib/pin-ref.js";
 import {
   secretsList,
   secretsCheck,
@@ -178,7 +179,7 @@ program
   .command("install <name-or-url>")
   .description("Install a skill from git URL, or by name from the registry")
   .option("-y, --yes", "Skip confirmation prompt")
-  .option("--pin <version>", "Pin to a specific version (git tag)")
+  .option("--pin <ref>", "Pin to a specific git ref: tag, branch, or commit SHA (a bare semver like 1.2.0 resolves tag v1.2.0 then 1.2.0)")
   .option("--bin-dir <path>", "Directory for PATH-accessible command shims")
   .option("--strict-signing", "Refuse to install if Sigstore signature is missing on an official-tier package")
   .option("--skip-secrets", "Install without provisioning declared secrets (daemon fails at first use with a clear message)")
@@ -231,19 +232,29 @@ program
 
     let libraryName: string | undefined;
     let artifactName: string | undefined;
-    // Validate --pin flag: must look like semver (same check as @version suffix)
-    if (opts.pin && !/^v?\d+\.\d+/.test(opts.pin)) {
-      console.error(`Invalid version "${opts.pin}". Expected semver (e.g., 1.2.0).`);
+    // Injection guard only (arc#387) — --pin now accepts any git ref (tag,
+    // branch, or commit SHA), not just a semver-shaped tag. This blocks a
+    // value that could be misread by `git checkout` or split into an extra
+    // argv option; it does not judge whether the ref itself resolves —
+    // an unresolvable ref is reported later, once the clone exists, by
+    // checkoutPinnedRef. See isSafePinRef's docstring for the exact rules.
+    if (opts.pin && !isSafePinRef(opts.pin)) {
+      console.error(`Invalid --pin ref "${opts.pin}": must not start with '-' or contain whitespace or '..'.`);
       process.exit(1);
     }
-    let pinnedVersion: string | undefined = opts.pin?.replace(/^v/, "");
+    // Pass the ref through verbatim — no leading-`v` strip here. Stripping
+    // unconditionally (arc's pre-#387 behaviour) would corrupt a branch
+    // literally named e.g. "v2-migration" into "2-migration". v-handling
+    // now lives in pinRefCandidates(), applied only to the semver-shaped
+    // case (src/lib/pin-ref.ts).
+    let pinnedRef: string | undefined = opts.pin;
     let lookupName = nameOrUrl;
 
     if (!isUrl && !pkgRef) {
       // Check for version suffix: MySkill@1.2.0
       const nameVer = parseNameVersion(nameOrUrl);
       if (nameVer) {
-        pinnedVersion ??= nameVer.version;
+        pinnedRef ??= nameVer.version;
         lookupName = nameVer.name;
       }
 
@@ -454,7 +465,7 @@ program
       }
     } else if (isUrl) {
       // Direct git install
-      const result = await install({ arc: paths, host, db, repoUrl: nameOrUrl, yes: opts.yes, artifactName, pinnedVersion, skipSecrets: opts.skipSecrets, fromEnv: opts.fromEnv, secretBackend, hostOverrides: cortexSteering.hostOverrides, cortexConfigEnv: cortexSteering.cortexConfigEnv });
+      const result = await install({ arc: paths, host, db, repoUrl: nameOrUrl, yes: opts.yes, artifactName, pinnedRef, skipSecrets: opts.skipSecrets, fromEnv: opts.fromEnv, secretBackend, hostOverrides: cortexSteering.hostOverrides, cortexConfigEnv: cortexSteering.cortexConfigEnv });
       if (result.success) {
         if (result.alreadyInstalled) {
           // arc#354: re-running install on an installed package is a no-op.
@@ -480,7 +491,7 @@ program
         process.exit(1);
       }
 
-      const versionLabel = pinnedVersion ? ` (pinned: v${pinnedVersion})` : "";
+      const versionLabel = pinnedRef ? ` (pinned: ${pinnedRef})` : "";
       console.log(`Found ${lookupName} [${found.artifactType}] in ${found.sourceName} [${found.sourceTier}]${versionLabel}`);
 
       // Install directly from the source URL
@@ -494,7 +505,7 @@ program
         sourceTier: found.sourceTier,
         artifactName,
         libraryName,
-        pinnedVersion,
+        pinnedRef,
         skipSecrets: opts.skipSecrets,
         fromEnv: opts.fromEnv,
         secretBackend,

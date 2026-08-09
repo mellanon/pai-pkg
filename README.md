@@ -472,7 +472,27 @@ Tags must match the manifest version (tag `v1.2.0` ↔ manifest `version: 1.2.0`
 
 GitHub Releases are the changelog — no separate CHANGELOG.md needed. `arc info` fetches and displays release notes directly via the `gh` CLI.
 
-Registry entries include a `version` field to advertise the latest available version. `arc upgrade --check` compares installed versions against registry versions. Pinned installs (`arc install MySkill@1.2.0`) are planned for a future release.
+Registry entries include a `version` field to advertise the latest available version. `arc upgrade --check` compares installed versions against registry versions.
+
+### Pinned installs
+
+`arc install <url> --pin <ref>` installs a specific git ref instead of the repo's default branch. `<ref>` accepts a tag, a branch, or a commit SHA:
+
+```bash
+# Tag — bare semver tries "v{x}" then "{x}", so both tagging conventions work
+arc install https://github.com/the-metafactory/some-skill --pin 1.2.0
+
+# Branch — useful for testing an unmerged change end-to-end
+arc install https://github.com/the-metafactory/some-skill --pin feat/x
+
+# Commit SHA (full or short) — the only unambiguous way to name code,
+# and works even in a repo with no tags at all
+arc install https://github.com/the-metafactory/some-skill --pin 5cdaa18595052e23e7be39223eae8ceb072c898b
+```
+
+The `name@version` suffix form (`arc install MySkill@1.2.0`) is unchanged — it stays semver-only.
+
+A tag pin is what `arc upgrade` already understands (a release). A branch or commit-SHA pin is **install-time only**: arc doesn't record which ref you pinned, so a later `arc upgrade <name>` moves the checkout forward same as any other install. Re-run `arc install --pin <ref>` to return to a specific ref.
 
 ---
 

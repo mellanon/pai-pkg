@@ -15,6 +15,7 @@ import { readManifest, readLibraryArtifacts, assessRisk, formatAuthor, formatCap
 import { getSkill, removeSkill } from "../lib/db.js";
 import { runScript, runLifecycleScripts } from "../lib/scripts.js";
 import { satisfiesRange } from "../lib/semver.js";
+import { isSemverShapedRef, pinRefCandidates } from "../lib/pin-ref.js";
 import {
   type ArtifactSymlinkRecord,
   artifactDropPresent,
@@ -110,8 +111,14 @@ export interface InstallOptions {
    * When provided, skips git clone and uses this directory as the source.
    */
   preExtractedPath?: string;
-  /** Pinned version — checkout this git tag after clone (e.g., "1.2.0" tries v1.2.0 then 1.2.0) */
-  pinnedVersion?: string;
+  /**
+   * Pinned git ref — checkout this ref after clone (arc#387). A semver-shaped
+   * value (e.g. "1.2.0") tries tag "v1.2.0" then "1.2.0" (compat contract
+   * with arc's pre-#387 tag-only behaviour); anything else — a branch, a
+   * full or short commit SHA, a non-semver tag — is checked out verbatim.
+   * See src/lib/pin-ref.ts for the full grammar.
+   */
+  pinnedRef?: string;
   /**
    * Per-host adapter overrides for multi-target installs (arc#140 P3).
    *
@@ -486,9 +493,9 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
       };
     }
 
-    // Checkout pinned version tag if specified
-    if (opts.pinnedVersion) {
-      const checkoutResult = checkoutVersionTag(installPath, opts.pinnedVersion);
+    // Checkout pinned ref if specified (arc#387)
+    if (opts.pinnedRef) {
+      const checkoutResult = checkoutPinnedRef(installPath, opts.pinnedRef);
       if (!checkoutResult.success) {
         Bun.spawnSync(["rm", "-rf", installPath], { stdout: "pipe", stderr: "pipe" });
         return { success: false, error: checkoutResult.error ?? "checkout failed" };
@@ -1596,37 +1603,102 @@ export function parseNameVersion(input: string): { name: string; version: string
 }
 
 /**
- * Checkout a version tag in a cloned git repo.
- * Tries "v{version}" first, then "{version}" as a tag name.
+ * Checkout a pinned git ref in a cloned repo (arc#387). `ref` builds a
+ * candidate list via pinRefCandidates() (src/lib/pin-ref.ts): a
+ * semver-shaped value tries tag "v{x}" then "{x}" — byte-identical to
+ * arc's pre-#387 tag-only behaviour, a compatibility contract — while
+ * anything else (a branch, a full/short commit SHA, a non-semver tag) is
+ * tried exactly once, verbatim, with no `v`-stripping and no prefixing.
+ *
+ * Every `git checkout` call passes a trailing `--` (post-#387 review
+ * finding, HIGH) to force `<candidate>` to resolve as a revision, never a
+ * pathspec. Without it, `git checkout <arg>` silently accepts an `<arg>`
+ * that isn't a ref at all but IS a path in the working tree — it
+ * reinterprets it as a pathspec restore ("Updated 0 paths from the
+ * index"), exits 0, and leaves HEAD untouched. Pre-#387 the semver-only
+ * regex made a filename collision unlikely; once any string is a
+ * candidate, `--pin arc-manifest.yaml` (a file every arc package ships at
+ * its repo root) — or `docs`, `src`, `test` — would silently "succeed"
+ * while installing whatever the default branch happened to be, printing a
+ * specific, plausible-looking pinned commit that was never actually
+ * checked out. `git checkout <ref> --` fails loudly (`fatal: invalid
+ * reference`, exit 128) instead. This was checked against a pre-check
+ * alternative (`git rev-parse --verify "<ref>^{commit}"` before checkout)
+ * and rejected: `rev-parse` does NOT perform checkout's own
+ * remote-tracking-branch DWIM (a bare branch name that exists only as
+ * `origin/<branch>` post-clone — i.e. every branch except whichever one
+ * HEAD happened to point at when cloned — fails to resolve under
+ * `rev-parse`), so that approach silently broke branch pinning. `--` keeps
+ * `git checkout` itself as the resolver, so its DWIM is untouched, and
+ * only strips pathspec fallback.
  */
-function checkoutVersionTag(
+function checkoutPinnedRef(
   repoPath: string,
-  version: string,
-): { success: boolean; tag?: string; error?: string } {
-  // Try v-prefixed tag first (most common: v1.2.0)
-  const vTag = version.startsWith("v") ? version : `v${version}`;
-  const plainTag = version.startsWith("v") ? version.slice(1) : version;
+  ref: string,
+): { success: boolean; ref?: string; error?: string } {
+  const candidates = pinRefCandidates(ref);
+  const semverShaped = isSemverShapedRef(ref);
 
-  for (const tag of [vTag, plainTag]) {
+  for (const candidate of candidates) {
     const result = Bun.spawnSync(
-      ["git", "checkout", tag],
+      ["git", "checkout", candidate, "--"],
       { cwd: repoPath, stdout: "pipe", stderr: "pipe" },
     );
     if (result.exitCode === 0) {
-      return { success: true, tag };
+      // Record what was actually pinned, and warn that it won't survive
+      // `arc upgrade` (arc#387 — arc has nowhere to record a non-tag pin;
+      // see the issue's "Interaction with arc#272 / #371 / PR #308").
+      // Skipped for the semver/tag path: the resolved ref there IS a
+      // release tag, which `arc upgrade` already understands.
+      if (!semverShaped) {
+        const shaResult = Bun.spawnSync(
+          ["git", "rev-parse", "--short", "HEAD"],
+          { cwd: repoPath, stdout: "pipe", stderr: "pipe" },
+        );
+        const shortSha = shaResult.exitCode === 0 ? shaResult.stdout.toString().trim() : "unknown";
+        process.stderr.write(`arc: pinned to ${candidate} (${shortSha})\n`);
+        process.stderr.write(
+          `arc: WARN — ${candidate} is an install-time pin only; \`arc upgrade <name>\` will move this checkout. Re-run \`arc install --pin\` to return to a specific ref.\n`,
+        );
+      }
+      return { success: true, ref: candidate };
     }
   }
 
-  // List available tags for a helpful error
+  // List available tags for a helpful error.
   const tagList = Bun.spawnSync(
     ["git", "tag", "--list", "--sort=-v:refname"],
     { cwd: repoPath, stdout: "pipe", stderr: "pipe" },
   );
   const tags = tagList.stdout.toString().trim().split("\n").filter(Boolean).slice(0, 5);
-  const available = tags.length ? ` Available: ${tags.join(", ")}` : "";
+
+  if (semverShaped) {
+    // Preserve the pre-#387 error string verbatim — asserted by
+    // test/commands/install.test.ts ("fails when pinned version tag does
+    // not exist").
+    const [vTag, plainTag] = candidates;
+    const available = tags.length ? ` Available: ${tags.join(", ")}` : "";
+    return {
+      success: false,
+      error: `Version ${ref} not found (tried tags ${vTag}, ${plainTag}).${available}`,
+    };
+  }
+
+  // Non-semver miss: also surface branches, since a ref this shape is at
+  // least as likely to be a branch as a tag.
+  const branchList = Bun.spawnSync(
+    ["git", "branch", "-r", "--format=%(refname:short)"],
+    { cwd: repoPath, stdout: "pipe", stderr: "pipe" },
+  );
+  const branches = branchList.stdout.toString().trim().split("\n").filter(Boolean).slice(0, 5);
+
+  const availableParts: string[] = [];
+  if (tags.length) availableParts.push(`tags: ${tags.join(", ")}`);
+  if (branches.length) availableParts.push(`branches: ${branches.join(", ")}`);
+  const available = availableParts.length ? ` Available ${availableParts.join("; ")}.` : "";
 
   return {
     success: false,
-    error: `Version ${version} not found (tried tags ${vTag}, ${plainTag}).${available}`,
+    error: `Ref "${ref}" not found in the cloned repo (not a branch, tag, or commit).${available}`,
   };
 }

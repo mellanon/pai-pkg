@@ -659,7 +659,7 @@ describe("install command", () => {
       db: env.db,
       repoUrl: repo.url,
       yes: true,
-      pinnedVersion: "1.0.0",
+      pinnedRef: "1.0.0",
     });
 
     expect(result.success).toBe(true);
@@ -677,7 +677,7 @@ describe("install command", () => {
       db: env.db,
       repoUrl: repo.url,
       yes: true,
-      pinnedVersion: "9.9.9",
+      pinnedRef: "9.9.9",
     });
 
     expect(result.success).toBe(false);
@@ -701,11 +701,253 @@ describe("install command", () => {
       db: env.db,
       repoUrl: repo.url,
       yes: true,
-      pinnedVersion: "1.0.0",
+      pinnedRef: "1.0.0",
     });
 
     expect(result.success).toBe(true);
     expect(result.version).toBe("1.0.0");
+  });
+
+  test("installs a pinned branch as a live tracking branch, not detached", async () => {
+    const repo = await createMockSkillRepo(env.root, {
+      name: "BranchSkill",
+      version: "1.0.0",
+    });
+
+    const defaultBranchResult = Bun.spawnSync(
+      ["git", "symbolic-ref", "--short", "HEAD"],
+      { cwd: repo.path, stdout: "pipe", stderr: "pipe" },
+    );
+    const defaultBranch = defaultBranchResult.stdout.toString().trim();
+
+    // Branch with a distinct manifest version, so we can tell which ref
+    // landed.
+    Bun.spawnSync(["git", "checkout", "-q", "-b", "feature/x"], { cwd: repo.path, stdout: "pipe", stderr: "pipe" });
+    const manifestPath = join(repo.path, "arc-manifest.yaml");
+    const content = await Bun.file(manifestPath).text();
+    await Bun.write(manifestPath, content.replace("1.0.0", "2.0.0"));
+    Bun.spawnSync(["git", "add", "."], { cwd: repo.path, stdout: "pipe", stderr: "pipe" });
+    Bun.spawnSync(
+      ["git", "-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "branch bump"],
+      { cwd: repo.path, stdout: "pipe", stderr: "pipe" },
+    );
+    Bun.spawnSync(["git", "checkout", "-q", defaultBranch], { cwd: repo.path, stdout: "pipe", stderr: "pipe" });
+
+    const result = await install({
+      arc: env.arc, host: env.host,
+      db: env.db,
+      repoUrl: repo.url,
+      yes: true,
+      pinnedRef: "feature/x",
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.version).toBe("2.0.0");
+
+    const repoDir = join(env.arc.reposDir, "mock-BranchSkill");
+    const branchResult = Bun.spawnSync(
+      ["git", "symbolic-ref", "--short", "HEAD"],
+      { cwd: repoDir, stdout: "pipe", stderr: "pipe" },
+    );
+    expect(branchResult.exitCode).toBe(0);
+    expect(branchResult.stdout.toString().trim()).toBe("feature/x");
+  });
+
+  test("installs a pinned full commit SHA at exactly that commit", async () => {
+    const repo = await createMockSkillRepo(env.root, {
+      name: "ShaSkill",
+      version: "1.0.0",
+    });
+
+    const shaResult = Bun.spawnSync(
+      ["git", "rev-parse", "HEAD"],
+      { cwd: repo.path, stdout: "pipe", stderr: "pipe" },
+    );
+    const sha = shaResult.stdout.toString().trim();
+    expect(sha).toMatch(/^[0-9a-f]{40}$/);
+
+    const result = await install({
+      arc: env.arc, host: env.host,
+      db: env.db,
+      repoUrl: repo.url,
+      yes: true,
+      pinnedRef: sha,
+    });
+
+    expect(result.success).toBe(true);
+
+    const repoDir = join(env.arc.reposDir, "mock-ShaSkill");
+    const headResult = Bun.spawnSync(
+      ["git", "rev-parse", "HEAD"],
+      { cwd: repoDir, stdout: "pipe", stderr: "pipe" },
+    );
+    expect(headResult.stdout.toString().trim()).toBe(sha);
+  });
+
+  test("installs a pinned short commit SHA at exactly the full commit", async () => {
+    const repo = await createMockSkillRepo(env.root, {
+      name: "ShortShaSkill",
+      version: "1.0.0",
+    });
+
+    const shaResult = Bun.spawnSync(
+      ["git", "rev-parse", "HEAD"],
+      { cwd: repo.path, stdout: "pipe", stderr: "pipe" },
+    );
+    const sha = shaResult.stdout.toString().trim();
+    const shortSha = sha.slice(0, 7);
+
+    const result = await install({
+      arc: env.arc, host: env.host,
+      db: env.db,
+      repoUrl: repo.url,
+      yes: true,
+      pinnedRef: shortSha,
+    });
+
+    expect(result.success).toBe(true);
+
+    const repoDir = join(env.arc.reposDir, "mock-ShortShaSkill");
+    const headResult = Bun.spawnSync(
+      ["git", "rev-parse", "HEAD"],
+      { cwd: repoDir, stdout: "pipe", stderr: "pipe" },
+    );
+    expect(headResult.stdout.toString().trim()).toBe(sha);
+  });
+
+  test("fails with a clear message for an unresolvable ref", async () => {
+    const repo = await createMockSkillRepo(env.root, {
+      name: "UnknownRefSkill",
+      version: "1.0.0",
+    });
+
+    const result = await install({
+      arc: env.arc, host: env.host,
+      db: env.db,
+      repoUrl: repo.url,
+      yes: true,
+      pinnedRef: "no-such-ref",
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Ref "no-such-ref" not found');
+  });
+
+  test("does not strip the v prefix from a branch name (arc#387 regression guard)", async () => {
+    const repo = await createMockSkillRepo(env.root, {
+      name: "VBranchSkill",
+      version: "1.0.0",
+    });
+
+    const defaultBranchResult = Bun.spawnSync(
+      ["git", "symbolic-ref", "--short", "HEAD"],
+      { cwd: repo.path, stdout: "pipe", stderr: "pipe" },
+    );
+    const defaultBranch = defaultBranchResult.stdout.toString().trim();
+
+    Bun.spawnSync(["git", "checkout", "-q", "-b", "v2-migration"], { cwd: repo.path, stdout: "pipe", stderr: "pipe" });
+    Bun.spawnSync(["git", "checkout", "-q", defaultBranch], { cwd: repo.path, stdout: "pipe", stderr: "pipe" });
+
+    const result = await install({
+      arc: env.arc, host: env.host,
+      db: env.db,
+      repoUrl: repo.url,
+      yes: true,
+      pinnedRef: "v2-migration",
+    });
+
+    expect(result.success).toBe(true);
+
+    const repoDir = join(env.arc.reposDir, "mock-VBranchSkill");
+    const branchResult = Bun.spawnSync(
+      ["git", "symbolic-ref", "--short", "HEAD"],
+      { cwd: repoDir, stdout: "pipe", stderr: "pipe" },
+    );
+    expect(branchResult.exitCode).toBe(0);
+    expect(branchResult.stdout.toString().trim()).toBe("v2-migration");
+  });
+
+  test("prefers the v-prefixed tag when both v-prefixed and bare tags exist", async () => {
+    const repo = await createMockSkillRepo(env.root, {
+      name: "DualTagSkill",
+      version: "1.0.0",
+    });
+
+    // v1.0.0 tags the initial commit (version 1.0.0).
+    Bun.spawnSync(["git", "tag", "v1.0.0"], { cwd: repo.path, stdout: "pipe", stderr: "pipe" });
+
+    // A second commit, bumped to a distinct marker version, tagged with
+    // the BARE name "1.0.0". If candidate order were bare-first (or
+    // last-write-wins), pinning "1.0.0" would land here instead.
+    const manifestPath = join(repo.path, "arc-manifest.yaml");
+    const content = await Bun.file(manifestPath).text();
+    await Bun.write(manifestPath, content.replace("1.0.0", "9.0.0"));
+    Bun.spawnSync(["git", "add", "."], { cwd: repo.path, stdout: "pipe", stderr: "pipe" });
+    Bun.spawnSync(
+      ["git", "-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "bump to 9.0.0"],
+      { cwd: repo.path, stdout: "pipe", stderr: "pipe" },
+    );
+    Bun.spawnSync(["git", "tag", "1.0.0"], { cwd: repo.path, stdout: "pipe", stderr: "pipe" });
+
+    const result = await install({
+      arc: env.arc, host: env.host,
+      db: env.db,
+      repoUrl: repo.url,
+      yes: true,
+      pinnedRef: "1.0.0",
+    });
+
+    expect(result.success).toBe(true);
+    // Landed on the v1.0.0 tag (first commit), not the bare 1.0.0 tag
+    // (second commit) — proves candidate order is v-prefixed first.
+    expect(result.version).toBe("1.0.0");
+  });
+
+  test("rejects a --pin value that names a real file, not a ref (arc#387 pathspec-restore regression guard)", async () => {
+    // git checkout <arg> silently accepts an <arg> that isn't a ref at all
+    // but IS a path in the working tree — it reinterprets it as a pathspec
+    // restore ("Updated 0 paths from the index"), exits 0, and leaves HEAD
+    // untouched. Pre-#387 the semver-only regex made this collision
+    // unlikely; post-#387 any string is a candidate, and every arc package
+    // ships arc-manifest.yaml at its repo root. Without the rev-parse
+    // --verify pre-check, this would come back success:true, silently
+    // "pinned" to the default branch's HEAD instead of failing.
+    const repo = await createMockSkillRepo(env.root, {
+      name: "PathCollisionSkill",
+      version: "1.0.0",
+    });
+
+    const result = await install({
+      arc: env.arc, host: env.host,
+      db: env.db,
+      repoUrl: repo.url,
+      yes: true,
+      pinnedRef: "arc-manifest.yaml",
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Ref "arc-manifest.yaml" not found');
+  });
+
+  test("rejects a --pin value that names a real directory, not a ref (arc#387 pathspec-restore regression guard)", async () => {
+    // Same class as the file case above, but for a directory pathspec
+    // (e.g. "skill", "docs", "src", "test") — git checkout treats a
+    // directory argument the same way: silent no-op restore, exit 0.
+    const repo = await createMockSkillRepo(env.root, {
+      name: "DirCollisionSkill",
+      version: "1.0.0",
+    });
+
+    const result = await install({
+      arc: env.arc, host: env.host,
+      db: env.db,
+      repoUrl: repo.url,
+      yes: true,
+      pinnedRef: "skill",
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Ref "skill" not found');
   });
 });
 
