@@ -1609,6 +1609,28 @@ export function parseNameVersion(input: string): { name: string; version: string
  * arc's pre-#387 tag-only behaviour, a compatibility contract — while
  * anything else (a branch, a full/short commit SHA, a non-semver tag) is
  * tried exactly once, verbatim, with no `v`-stripping and no prefixing.
+ *
+ * Every `git checkout` call passes a trailing `--` (post-#387 review
+ * finding, HIGH) to force `<candidate>` to resolve as a revision, never a
+ * pathspec. Without it, `git checkout <arg>` silently accepts an `<arg>`
+ * that isn't a ref at all but IS a path in the working tree — it
+ * reinterprets it as a pathspec restore ("Updated 0 paths from the
+ * index"), exits 0, and leaves HEAD untouched. Pre-#387 the semver-only
+ * regex made a filename collision unlikely; once any string is a
+ * candidate, `--pin arc-manifest.yaml` (a file every arc package ships at
+ * its repo root) — or `docs`, `src`, `test` — would silently "succeed"
+ * while installing whatever the default branch happened to be, printing a
+ * specific, plausible-looking pinned commit that was never actually
+ * checked out. `git checkout <ref> --` fails loudly (`fatal: invalid
+ * reference`, exit 128) instead. This was checked against a pre-check
+ * alternative (`git rev-parse --verify "<ref>^{commit}"` before checkout)
+ * and rejected: `rev-parse` does NOT perform checkout's own
+ * remote-tracking-branch DWIM (a bare branch name that exists only as
+ * `origin/<branch>` post-clone — i.e. every branch except whichever one
+ * HEAD happened to point at when cloned — fails to resolve under
+ * `rev-parse`), so that approach silently broke branch pinning. `--` keeps
+ * `git checkout` itself as the resolver, so its DWIM is untouched, and
+ * only strips pathspec fallback.
  */
 function checkoutPinnedRef(
   repoPath: string,
@@ -1619,7 +1641,7 @@ function checkoutPinnedRef(
 
   for (const candidate of candidates) {
     const result = Bun.spawnSync(
-      ["git", "checkout", candidate],
+      ["git", "checkout", candidate, "--"],
       { cwd: repoPath, stdout: "pipe", stderr: "pipe" },
     );
     if (result.exitCode === 0) {

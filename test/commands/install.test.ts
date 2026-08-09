@@ -902,6 +902,53 @@ describe("install command", () => {
     // (second commit) — proves candidate order is v-prefixed first.
     expect(result.version).toBe("1.0.0");
   });
+
+  test("rejects a --pin value that names a real file, not a ref (arc#387 pathspec-restore regression guard)", async () => {
+    // git checkout <arg> silently accepts an <arg> that isn't a ref at all
+    // but IS a path in the working tree — it reinterprets it as a pathspec
+    // restore ("Updated 0 paths from the index"), exits 0, and leaves HEAD
+    // untouched. Pre-#387 the semver-only regex made this collision
+    // unlikely; post-#387 any string is a candidate, and every arc package
+    // ships arc-manifest.yaml at its repo root. Without the rev-parse
+    // --verify pre-check, this would come back success:true, silently
+    // "pinned" to the default branch's HEAD instead of failing.
+    const repo = await createMockSkillRepo(env.root, {
+      name: "PathCollisionSkill",
+      version: "1.0.0",
+    });
+
+    const result = await install({
+      arc: env.arc, host: env.host,
+      db: env.db,
+      repoUrl: repo.url,
+      yes: true,
+      pinnedRef: "arc-manifest.yaml",
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Ref "arc-manifest.yaml" not found');
+  });
+
+  test("rejects a --pin value that names a real directory, not a ref (arc#387 pathspec-restore regression guard)", async () => {
+    // Same class as the file case above, but for a directory pathspec
+    // (e.g. "skill", "docs", "src", "test") — git checkout treats a
+    // directory argument the same way: silent no-op restore, exit 0.
+    const repo = await createMockSkillRepo(env.root, {
+      name: "DirCollisionSkill",
+      version: "1.0.0",
+    });
+
+    const result = await install({
+      arc: env.arc, host: env.host,
+      db: env.db,
+      repoUrl: repo.url,
+      yes: true,
+      pinnedRef: "skill",
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Ref "skill" not found');
+  });
 });
 
 describe("install provides.files (issue #84)", () => {
