@@ -1,5 +1,6 @@
 import { readFileSync } from "fs";
 import { join } from "path";
+import { dropUntrackedBunLock, installNodeDependencies } from "../lib/artifact-installer.js";
 
 export interface SelfUpdateResult {
   success: boolean;
@@ -38,6 +39,13 @@ export async function selfUpdate(): Promise<SelfUpdateResult> {
     cwd: pkgRoot, stdout: "pipe", stderr: "pipe",
   }).stdout.toString().trim();
 
+  // arc#386: a checkout that predates arc tracking bun.lock has an
+  // untracked one lying around. `git pull --ff-only` refuses to overwrite
+  // an untracked file the incoming commit also adds, which would otherwise
+  // brick self-update on exactly the release meant to fix this. Safe to
+  // drop — `installNodeDependencies` below regenerates it.
+  dropUntrackedBunLock(pkgRoot);
+
   // git pull --ff-only
   const pull = Bun.spawnSync(["git", "pull", "--ff-only"], {
     cwd: pkgRoot,
@@ -73,21 +81,19 @@ export async function selfUpdate(): Promise<SelfUpdateResult> {
     }
   }
 
-  // bun install (in case deps changed)
-  const install = Bun.spawnSync(["bun", "install"], {
-    cwd: pkgRoot,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  // bun install (in case deps changed) — routed through the shared
+  // frozen-first / unfrozen-retry helper (arc#284/#289) so arc's own
+  // self-update gets the same reproducible-install guarantee as every
+  // package arc installs, now that arc ships a committed bun.lock (arc#386).
+  const install = installNodeDependencies(pkgRoot);
 
-  if (install.exitCode !== 0) {
-    const stderr = install.stderr.toString().trim();
+  if (install.ran && !install.success) {
     return {
       success: false,
       oldVersion,
       newVersion: oldVersion,
       commitsPulled,
-      error: `bun install failed: ${stderr}`,
+      error: `bun install failed: ${install.error ?? "unknown error"}`,
     };
   }
 
@@ -231,7 +237,19 @@ function checkDevCheckout(pkgRoot: string): string | null {
     { cwd: pkgRoot, stdout: "pipe", stderr: "pipe" },
   );
   if (statusResult.exitCode === 0) {
-    const status = statusResult.stdout.toString().trim();
+    // Filter out expected untracked files from bun install — same shape as
+    // the "Git repo clean" check in verify.ts:96. An untracked bun.lock
+    // (left behind by a checkout that predates arc#386 tracking it) or
+    // node_modules is not a sign of a dev checkout and must not block
+    // self-update. A MODIFIED tracked lockfile (" M bun.lock" / "M  bun.lock")
+    // still refuses below — that's genuine dependency drift.
+    const ignored = /^(\?\? |..)?(node_modules\/|bun\.lock|\.DS_Store)$/;
+    const status = statusResult.stdout
+      .toString()
+      .trim()
+      .split("\n")
+      .filter((l) => l && !ignored.test(l))
+      .join("\n");
     if (status.length > 0) {
       return `Refusing self-update: arc repo has uncommitted changes. This looks like a dev checkout — commit or stash your changes first, or update manually with git.`;
     }

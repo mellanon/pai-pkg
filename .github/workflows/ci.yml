@@ -24,6 +24,13 @@ jobs:
         with:
           bun-version: "latest"
 
+      - name: Assert bun.lock is tracked
+        run: |
+          if ! git ls-files --error-unmatch bun.lock > /dev/null 2>&1; then
+            echo "::error::bun.lock is not tracked by git — the --frozen-lockfile CI gates have nothing to freeze against (arc#386)."
+            exit 1
+          fi
+
       - run: bun install --frozen-lockfile
 
       - name: ESLint (errors only — gate)

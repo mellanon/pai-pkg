@@ -1080,7 +1080,7 @@ program
 program
   .command("self-upgrade")
   .alias("self-update")
-  .description("Update arc itself (git pull + bun install)")
+  .description("Update arc itself (git pull + frozen bun install)")
   .action(async () => {
     const result = await selfUpdate();
     console.log(formatSelfUpdate(result));

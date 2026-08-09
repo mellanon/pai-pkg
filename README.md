@@ -380,6 +380,11 @@ skills/CLIs arc installs generally. A scoped `--production` re-add with a
 manifest opt-out is tracked in
 [arc#290](https://github.com/the-metafactory/arc/issues/290).
 
+arc itself now ships a committed `bun.lock` (arc#386), so arc-the-package
+takes the `--frozen-lockfile` path like every other well-behaved package when
+installed or upgraded via `arc install arc` / `arc upgrade arc`, and
+`arc self-upgrade` installs its own dependencies frozen too.
+
 ### Version-compat surfacing
 
 `arc list --json` exposes every installed package's `version`
