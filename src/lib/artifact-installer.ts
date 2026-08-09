@@ -789,6 +789,37 @@ export function reportNodeDependencyResult(
 }
 
 /**
+ * Delete `bun.lock` in `cwd` if it exists on disk but is NOT tracked by git.
+ *
+ * arc#386: any checkout that ran `bun install` before its origin started
+ * tracking `bun.lock` has an untracked `bun.lock` sitting in the working
+ * tree. `git pull --ff-only` refuses to proceed when the incoming commit
+ * would overwrite an untracked file ("The following untracked working tree
+ * files would be overwritten by merge"), which bricks exactly the pull that
+ * is supposed to bring the fix. Deleting an untracked `bun.lock` immediately
+ * before a pull is safe: `installNodeDependencies` regenerates it a few
+ * steps later in both call sites (`self-update.ts`, `upgrade.ts`).
+ *
+ * Deliberately narrow — only the literal `bun.lock` path, only when git
+ * itself confirms it is untracked (`git ls-files --error-unmatch` exits
+ * non-zero for both "untracked" and "not a git repo"; either way there is
+ * nothing tracked to lose). This is not a general "clean untracked files"
+ * step and must not be widened into one.
+ */
+export function dropUntrackedBunLock(cwd: string): void {
+  const lockPath = join(cwd, "bun.lock");
+  if (!existsSync(lockPath)) return;
+
+  const tracked = Bun.spawnSync(
+    ["git", "ls-files", "--error-unmatch", "bun.lock"],
+    { cwd, stdout: "pipe", stderr: "pipe" },
+  );
+  if (tracked.exitCode !== 0) {
+    Bun.spawnSync(["rm", "-f", lockPath], { cwd, stdout: "pipe", stderr: "pipe" });
+  }
+}
+
+/**
  * Parse a "library:artifact" colon-separated reference.
  *
  * Returns null if the ref looks like a URL (contains "/") rather than a library ref.

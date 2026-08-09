@@ -25,7 +25,7 @@ import { generateRules } from "../lib/rules.js";
 import { wireExtensions } from "../lib/extensions.js";
 import { requireBrokerForManifest } from "../lib/nats-broker.js";
 import { runSomaSkillProjection } from "../lib/soma-projection.js";
-import { installNodeDependencies, reportNodeDependencyResult } from "../lib/artifact-installer.js";
+import { installNodeDependencies, reportNodeDependencyResult, dropUntrackedBunLock } from "../lib/artifact-installer.js";
 
 export interface UpgradeCheckResult {
   name: string;
@@ -397,6 +397,13 @@ export async function upgradePackage(
       cwd: gitCwd, stdout: "pipe", stderr: "pipe",
     });
     const preHeadSha = preHeadProbe.exitCode === 0 ? preHeadProbe.stdout.toString().trim() : null;
+
+    // arc#386: a checkout that predates its origin tracking bun.lock has an
+    // untracked one in the working tree. `git pull --ff-only` refuses to
+    // overwrite an untracked file the incoming commit also adds, which would
+    // otherwise brick `arc upgrade arc` on exactly the release meant to fix
+    // this. Safe to drop — installNodeDependencies below regenerates it.
+    dropUntrackedBunLock(gitCwd);
 
     // git pull in the cloned repo
     const pullResult = Bun.spawnSync(["git", "pull", "--ff-only"], {
