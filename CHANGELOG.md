@@ -2,10 +2,64 @@
 
 ## Unreleased
 
+## 0.45.0 — 2026-08-10
+
+Determinism chain, wave 1 ([#388](https://github.com/the-metafactory/arc/issues/388)) — reproducible installs and pinnable commits.
+
+### Fixed
+
+- **`bun.lock` is tracked, so the `--frozen-lockfile` CI gates are real** ([#386](https://github.com/the-metafactory/arc/issues/386)). arc had a lockfile; it was in `.gitignore`. A frozen install with nothing tracked to freeze against exits 0 and writes nothing, so all four `bun install --frozen-lockfile` call sites in CI ran and **could not fail** — 28 of 99 packages floated, and `self-update` ran a bare `bun install`, leaving arc's own updates unpinned. arc was the only ecosystem repo that gitignored its lockfile. The lockfile is now committed (a **pin, not an upgrade** — it captures what CI was already silently resolving; no dependency version moved), and CI additionally asserts the lockfile is *tracked* before the frozen install runs, so the precondition that makes the other gates meaningful cannot silently regress.
+- **`--pin` accepts any git ref — SHA, branch, or tag** ([#387](https://github.com/the-metafactory/arc/issues/387)). `arc install --pin` rejected anything non-semver at three separate layers, so pinning a commit for dev testing was impossible and downstream repos were minting throwaway `-rcN` tags on public repos to work around it (see signal#174). `--pin` now takes a full SHA, a short SHA, a branch name, or a tag; a bare `1.0.0` still resolves `v1.0.0` first, unchanged.
+- **A `--pin` value that names a path no longer silently installs the default branch** ([#387](https://github.com/the-metafactory/arc/issues/387)). `git checkout <arg>` exits 0 **without checking anything out** when `<arg>` is not a ref but *is* a path in the working tree — it reinterprets the argument as a pathspec restore. `checkoutPinnedRef` read that exit 0 as "ref checked out". The semver regex had made collisions unlikely; widening `--pin` made every string a candidate, including `arc-manifest.yaml`, which every arc package ships at its repo root — so `--pin arc-manifest.yaml` reported a plausible pinned commit, printed a success tick, and left HEAD on the default branch. Fixed by passing `git checkout <ref> --`, which forces revision interpretation while leaving checkout's own branch DWIM intact (a `rev-parse --verify` pre-check was tried first and rejected: it does not perform checkout's remote-tracking resolution and broke branch pinning). Guarded by two regression tests — pinning a real file and a real directory must both fail.
+
+## 0.44.3 — 2026-07-26
+
+### Fixed
+
+- **`arc remove`'s kept-summary only names paths that exist on disk** (cortex#2441 Note 2, [#379](https://github.com/the-metafactory/arc/pull/379)).
+
+## 0.44.2 — 2026-07-26
+
+### Fixed
+
+- **`arc remove` suggests `--purge`, and a failed postinstall rolls the clone back** ([#373](https://github.com/the-metafactory/arc/issues/373), [#376](https://github.com/the-metafactory/arc/pull/376)).
+
+## 0.44.1 — 2026-07-26
+
+### Added
+
+- **First-class `governance` artifact type** ([#361](https://github.com/the-metafactory/arc/issues/361), [#362](https://github.com/the-metafactory/arc/pull/362)) — fixes the compass-core install throw.
+
+### Fixed
+
+- **Object-form `capabilities.secrets` accepted; `validate` and `install` aligned** ([#363](https://github.com/the-metafactory/arc/issues/363), [#364](https://github.com/the-metafactory/arc/pull/364)).
+- **`namespace` is the bare scope, not `@scope`** ([#369](https://github.com/the-metafactory/arc/issues/369), [#370](https://github.com/the-metafactory/arc/pull/370)).
+- **Clearer secrets questionnaire** — banner, deduped GitHub prompt, explained warning ([#358](https://github.com/the-metafactory/arc/issues/358), [#375](https://github.com/the-metafactory/arc/pull/375)).
+- **The purge hook snapshots its scripts dir so it can source lib siblings** ([#372](https://github.com/the-metafactory/arc/issues/372), [#374](https://github.com/the-metafactory/arc/pull/374)).
+
+## 0.44.0 — 2026-07-23
+
+### Added
+
+- **`arc purge`, `owns` declarations, and `arc files` listing** ([#359](https://github.com/the-metafactory/arc/issues/359), [#360](https://github.com/the-metafactory/arc/pull/360)).
+- **`arc remove` cascades to exclusively-owned `depends_on.packages`** (refcounted, [#349](https://github.com/the-metafactory/arc/pull/349)).
+
 ### Fixed
 
 - **Already-installed is now the success case — install is idempotent** ([#354](https://github.com/the-metafactory/arc/issues/354)). `arc install <pkg>` aborted mid-way when a declared `depends_on.packages` entry was already installed ("Failed to install dependency 'agent-state': Skill 'AgentState' is already installed (status: active)") — the clone landed but skill projection never ran, leaving a half-installed state. Three changes: (1) the dependency loop resolves the installed row by declared name **or repo URL** (the declared dep name is the author's label and can differ from the installed manifest name — `agent-state` vs `AgentState`), treats an active row with its host drop present as **satisfied**, and when the arc#248 re-install path fires, removes the stale row by its *recorded* name; (2) `install()`'s duplicate guards return a **no-op success** (`alreadyInstalled: true`) for an active row (same repo URL, or same name at the same version) instead of an error — so re-running `arc install X` is harmless; a **disabled** row or a same-name **version mismatch** still errors with the arc#158 actionable hints (`arc enable` / `arc upgrade` / `arc remove`); (3) `depends_on.packages` entries may now declare an optional `version` range, checked when the dependency is already installed — out-of-range surfaces a WARN naming both versions and proceeds (the arc#284 warn-don't-fail posture; arc never silently upgrades an installed package as a side effect of installing its dependent).
 - **arc's own manifest migrated off the deprecated `{domain, reason}` network shape** ([#335](https://github.com/the-metafactory/arc/issues/335)): `arc-manifest.yaml` capabilities.network entries renamed `domain:` → `host:` (canonical shape).
+
+> No `0.43.x` was ever released — the line goes `0.42.1` → `0.44.0`.
+
+## 0.42.1 — 2026-07-18
+
+### Added
+
+- **`arc upgrade` cascades to installed `depends_on.packages`** — adapters and surfaces upgrade with cortex ([#347](https://github.com/the-metafactory/arc/pull/347)).
+
+### Changed
+
+- **`self-upgrade` is the canonical command**; `self-update` kept as an alias ([#345](https://github.com/the-metafactory/arc/pull/345)).
 
 ## 0.42.0 — 2026-07-17
 
