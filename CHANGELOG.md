@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`--pin` on an already-installed package moves the checkout instead of being silently ignored** ([#396](https://github.com/the-metafactory/arc/issues/396)). `arc install <repo> --pin <sha>` on an installed package exited 0, printed success, and left the checkout on whatever commit it was already on: the duplicate guard returned `alreadyInstalled` before any git ran, and `checkoutPinnedRef` sat inside the clone-only branch, unreachable. A pinned install is a determinism claim, so exit 0 + wrong commit is the worst available answer — automation trusts it (found while building smithy's `metafactory_cortex` role for crucible AC-3). The re-run now fetches, resolves the pin to a commit, and checks it out through the same `checkoutPinnedRef` the fresh-clone path uses, then records the manifest version at the new ref. Already at the pinned ref → no-op success, nothing touched. Uncommitted changes in the checkout → refuses loudly, naming the path and the dirty entries, and moves nothing (`node_modules/`, `bun.lock` and `.DS_Store` are arc's own leavings and don't count as dirty — the same filter `arc verify` uses). A re-run *without* `--pin` is unchanged. This moves code only; re-wiring hooks, templates, and dependencies remains `arc upgrade`'s job.
+
 ## 0.45.0 — 2026-08-10
 
 Determinism chain, wave 1 ([#388](https://github.com/the-metafactory/arc/issues/388)) — reproducible installs and pinnable commits.

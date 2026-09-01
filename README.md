@@ -494,6 +494,8 @@ The `name@version` suffix form (`arc install MySkill@1.2.0`) is unchanged — it
 
 A tag pin is what `arc upgrade` already understands (a release). A branch or commit-SHA pin is **install-time only**: arc doesn't record which ref you pinned, so a later `arc upgrade <name>` moves the checkout forward same as any other install. Re-run `arc install --pin <ref>` to return to a specific ref.
 
+Re-running `--pin` on a package that is already installed moves that checkout to the ref (arc#396) — it fetches first, so a ref minted since the install resolves. Already on the pinned ref, it does nothing and says so. If the checkout has uncommitted changes, arc refuses and names them rather than moving a dirty tree: commit, stash, or discard them, or `arc remove <name>` for a clean pinned re-install. A re-pin moves **code only** — it does not re-run `bun install`, lifecycle scripts, or hook and template wiring; that is `arc upgrade`'s job.
+
 ---
 
 ## Publishing

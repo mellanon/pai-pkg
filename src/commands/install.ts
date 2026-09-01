@@ -196,6 +196,15 @@ export interface InstallResult {
    * report "already installed" instead of "Installed vX".
    */
   alreadyInstalled?: boolean;
+  /**
+   * arc#396: the package was already installed and a `--pin` ref was given, so
+   * the existing checkout was MOVED to that ref (see `repinInstalledCheckout`).
+   * Mutually exclusive with `alreadyInstalled`: something changed on disk, so
+   * the caller must not print "nothing to do". `from`/`to` are full commit
+   * SHAs; they are equal when only HEAD's identity changed (detached →
+   * branch), which is still a move.
+   */
+  repinned?: { ref: string; from: string; to: string };
   error?: string;
   manifest?: ArcManifest;
   evidence?: InstallTransactionEvidence;
@@ -423,7 +432,7 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
     // Check if already installed in DB (by repo name or by scanning all skills)
     const allSkills = db
       .prepare("SELECT * FROM skills")
-      .all() as { name: string; version: string; status: string; repo_url: string; library_name: string | null }[];
+      .all() as { name: string; version: string; status: string; repo_url: string; install_path: string; library_name: string | null }[];
 
     // arc#354: an already-installed ACTIVE package is the SUCCESS case, not a
     // failure — `arc install X` twice is a harmless no-op, and a declared
@@ -435,12 +444,9 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
     const existingByUrl = allSkills.find((s) => s.repo_url === repoUrl && !s.library_name);
     if (existingByUrl) {
       if (existingByUrl.status === "active") {
-        return {
-          success: true,
-          alreadyInstalled: true,
-          name: existingByUrl.name,
-          version: existingByUrl.version,
-        };
+        // arc#396: a re-run carrying --pin is NOT a no-op — it is a request to
+        // move this checkout to that ref, exactly as the README promises.
+        return await repinOrNoop(existingByUrl, opts);
       }
       return {
         success: false,
@@ -458,14 +464,10 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
       );
       if (existingByPath && !existingByPath.library_name) {
         // Same arc#354 posture as the repo_url guard above: active → no-op
-        // success; disabled → actionable error.
+        // success (or an arc#396 re-pin when --pin is given); disabled →
+        // actionable error.
         if (existingByPath.status === "active") {
-          return {
-            success: true,
-            alreadyInstalled: true,
-            name: existingByPath.name,
-            version: existingByPath.version,
-          };
+          return await repinOrNoop(existingByPath, opts);
         }
         return {
           success: false,
@@ -1700,5 +1702,279 @@ function checkoutPinnedRef(
   return {
     success: false,
     error: `Ref "${ref}" not found in the cloned repo (not a branch, tag, or commit).${available}`,
+  };
+}
+
+/** Run a git command in `repoPath`, returning trimmed stdout (empty on failure). */
+function gitOut(repoPath: string, ...args: string[]): string {
+  const result = Bun.spawnSync(["git", ...args], {
+    cwd: repoPath,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return result.exitCode === 0 ? result.stdout.toString().trim() : "";
+}
+
+/**
+ * Working-tree entries that do NOT make a checkout dirty for arc's purposes.
+ *
+ * Byte-identical to the filter `arc verify`'s "Git repo clean" check uses
+ * (src/commands/verify.ts) and for the same reason: arc itself runs `bun
+ * install` inside the package checkout, so `node_modules/` and `bun.lock` are
+ * arc's own leavings. Counting them as the operator's uncommitted work would
+ * make the arc#396 dirty-tree refusal fire on practically every package with
+ * a package.json — a guard that always trips is a guard nobody keeps.
+ */
+const INSTALL_NOISE_ENTRY = /^(\?\? |..)?(node_modules\/|bun\.lock|\.DS_Store)$/;
+
+/** Porcelain status lines for `repoPath`, minus arc's own install leavings. */
+function dirtyWorktreeEntries(repoPath: string): string[] {
+  const result = Bun.spawnSync(["git", "status", "--porcelain"], {
+    cwd: repoPath,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0) return [];
+  return result.stdout
+    .toString()
+    .trim()
+    .split("\n")
+    .filter((l) => l && !INSTALL_NOISE_ENTRY.test(l));
+}
+
+/**
+ * Resolve a `--pin` ref to a commit SHA inside an EXISTING checkout, without
+ * moving HEAD (arc#396).
+ *
+ * Candidate order comes from pinRefCandidates() so resolution matches what
+ * `checkoutPinnedRef` will actually do. Each candidate is tried as
+ * `<c>^{commit}` and then as `origin/<c>^{commit}`: `git rev-parse` does NOT
+ * perform `git checkout`'s remote-tracking DWIM, so a branch that exists only
+ * as `origin/<c>` post-clone would otherwise fail to resolve here even though
+ * the checkout would succeed (the same trap documented on checkoutPinnedRef).
+ * `^{commit}` also keeps the arc#387 pathspec collision closed: a `--pin`
+ * value that names a file rather than a ref resolves to nothing.
+ *
+ * Returns null when nothing resolves — the caller then hands the ref to
+ * `checkoutPinnedRef`, which owns the loud, ref-listing error message.
+ */
+function resolvePinCommit(
+  repoPath: string,
+  ref: string,
+): { candidate: string; sha: string; isBranch: boolean } | null {
+  for (const candidate of pinRefCandidates(ref)) {
+    for (const rev of [candidate, `origin/${candidate}`]) {
+      const sha = gitOut(repoPath, "rev-parse", "--verify", "--quiet", `${rev}^{commit}`);
+      if (!sha) continue;
+      const isBranch =
+        Bun.spawnSync(
+          ["git", "show-ref", "--verify", "--quiet", `refs/heads/${candidate}`],
+          { cwd: repoPath, stdout: "pipe", stderr: "pipe" },
+        ).exitCode === 0 ||
+        Bun.spawnSync(
+          ["git", "show-ref", "--verify", "--quiet", `refs/remotes/origin/${candidate}`],
+          { cwd: repoPath, stdout: "pipe", stderr: "pipe" },
+        ).exitCode === 0;
+      return { candidate, sha, isBranch };
+    }
+  }
+  return null;
+}
+
+interface RepinOutcome {
+  success: boolean;
+  error?: string;
+  /** True when the checkout's HEAD (commit or branch identity) changed. */
+  moved: boolean;
+  /** The candidate that resolved/was checked out (e.g. "v2.0.0"). */
+  ref?: string;
+  from?: string;
+  to?: string;
+  /** Manifest read at the NEW ref — the version a fresh pinned install records. */
+  manifest?: ArcManifest;
+}
+
+/**
+ * Move an ALREADY-INSTALLED package's checkout to a `--pin` ref (arc#396).
+ *
+ * Before this, `arc install <repo> --pin <sha>` on an installed package hit
+ * the duplicate guard and returned `{success: true, alreadyInstalled: true}`
+ * before any git ran — exit 0, success text, checkout untouched. A pinned
+ * install is a determinism claim, so that combination is the worst possible
+ * answer: automation trusts it. The README's "Pinned installs" section already
+ * promised this behaviour ("Re-run `arc install --pin <ref>` to return to a
+ * specific ref"), so honour the promise rather than retract it.
+ *
+ * Order of business, and why:
+ *  1. `git fetch` first — the pin may name a ref minted after the clone. A
+ *     fetch failure is NOT fatal here (an offline re-pin to an already-local
+ *     ref must still work); it is remembered and appended to the checkout's
+ *     error if resolution then fails, so an offline miss never masquerades as
+ *     "no such ref".
+ *  2. Resolve the pin to a commit and compare with HEAD. Equal → nothing to
+ *     do, and (per the fix's contract) a dirty tree is not even consulted:
+ *     nothing is going to move, so there is nothing to clobber.
+ *  3. Refuse a dirty tree. `git checkout` would either carry the operator's
+ *     edits across the move or fail halfway; arc names the path and stops.
+ *  4. Reuse `checkoutPinnedRef` — the same function the fresh-clone path
+ *     uses, so the `--` pathspec guard, the candidate order, and the
+ *     install-time-pin warning are identical by construction, not by
+ *     duplication.
+ *  5. Validate the manifest at the new ref, and roll HEAD back if it is gone.
+ *     Landing on a ref with no arc-manifest.yaml would leave an installed
+ *     package pointing at something arc could never have installed.
+ *
+ * Deliberately NOT done: re-running `bun install`, lifecycle scripts, hook
+ * registration, or template regeneration. A re-pin moves code; re-wiring an
+ * install is `arc upgrade`'s job.
+ */
+async function repinInstalledCheckout(opts: {
+  name: string;
+  installPath: string;
+  pinnedRef: string;
+}): Promise<RepinOutcome> {
+  const { name, installPath, pinnedRef } = opts;
+
+  if (!existsSync(join(installPath, ".git"))) {
+    return {
+      success: false,
+      moved: false,
+      error: `Cannot re-pin '${name}' to ${pinnedRef}: no git checkout at ${installPath}. Run \`arc remove ${name}\` and install again with --pin.`,
+    };
+  }
+
+  const headBefore = gitOut(installPath, "rev-parse", "HEAD");
+  if (!headBefore) {
+    return {
+      success: false,
+      moved: false,
+      error: `Cannot re-pin '${name}' to ${pinnedRef}: ${installPath} has no resolvable HEAD.`,
+    };
+  }
+  // Empty when HEAD is detached — restoring to the branch NAME, not the SHA,
+  // is what keeps a rollback from silently detaching a tracking branch.
+  const branchBefore = gitOut(installPath, "symbolic-ref", "--quiet", "--short", "HEAD");
+
+  const fetch = Bun.spawnSync(["git", "fetch", "--quiet", "--tags"], {
+    cwd: installPath,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const fetchNote =
+    fetch.exitCode === 0
+      ? ""
+      : ` (note: \`git fetch\` failed first — ${fetch.stderr.toString().trim() || `exit ${fetch.exitCode}`})`;
+
+  const target = resolvePinCommit(installPath, pinnedRef);
+  // Already there: same commit AND, when the pin names a branch, already on
+  // that branch. Without the branch half, re-pinning a detached checkout to
+  // the branch sitting at the same commit would report "already at that ref"
+  // while HEAD stayed detached — a different state from a fresh
+  // `--pin <branch>` install, and the same silent-mismatch class as arc#396.
+  if (target?.sha === headBefore && (!target.isBranch || branchBefore === target.candidate)) {
+    return { success: true, moved: false, ref: target.candidate, from: headBefore, to: headBefore };
+  }
+
+  const dirty = dirtyWorktreeEntries(installPath);
+  if (dirty.length) {
+    const shown = dirty.slice(0, 10).join("\n  ");
+    const more = dirty.length > 10 ? `\n  …and ${dirty.length - 10} more` : "";
+    return {
+      success: false,
+      moved: false,
+      error:
+        `Refusing to re-pin '${name}' to ${pinnedRef}: ${installPath} has uncommitted changes.\n  ${shown}${more}\n` +
+        `Commit, stash, or discard them — or \`arc remove ${name}\` for a clean pinned re-install — then re-run \`arc install --pin ${pinnedRef}\`.`,
+    };
+  }
+
+  const checkout = checkoutPinnedRef(installPath, pinnedRef);
+  if (!checkout.success) {
+    return { success: false, moved: false, error: (checkout.error ?? "checkout failed") + fetchNote };
+  }
+
+  const headAfter = gitOut(installPath, "rev-parse", "HEAD");
+  const branchAfter = gitOut(installPath, "symbolic-ref", "--quiet", "--short", "HEAD");
+
+  let manifest: ArcManifest | null;
+  try {
+    manifest = await readManifest(installPath);
+  } catch {
+    manifest = null;
+  }
+  if (!manifest) {
+    // Restore the pre-re-pin HEAD: a ref with no readable manifest is not
+    // something arc could have installed in the first place, so leaving the
+    // checkout parked there would strand the package.
+    Bun.spawnSync(["git", "checkout", "--quiet", branchBefore || headBefore, "--"], {
+      cwd: installPath,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return {
+      success: false,
+      moved: false,
+      error: `Refusing to re-pin '${name}' to ${pinnedRef}: no readable arc-manifest.yaml at that ref. Left the checkout at ${branchBefore || headBefore.slice(0, 7)}.`,
+    };
+  }
+
+  return {
+    success: true,
+    moved: headAfter !== headBefore || branchAfter !== branchBefore,
+    ref: checkout.ref ?? pinnedRef,
+    from: headBefore,
+    to: headAfter,
+    manifest,
+  };
+}
+
+/**
+ * Outcome for an install() that hit a duplicate guard on an ACTIVE row
+ * (arc#354's no-op success) — re-pinning the existing checkout first when the
+ * re-run carries `--pin` (arc#396).
+ *
+ * Shared by both pre-clone duplicate guards so the repo_url path and the
+ * repo-name path cannot drift apart on the one behaviour that has to be
+ * identical: whether a `--pin` is honoured or ignored.
+ */
+async function repinOrNoop(
+  existing: { name: string; version: string; install_path: string },
+  opts: InstallOptions,
+): Promise<InstallResult> {
+  const noop: InstallResult = {
+    success: true,
+    alreadyInstalled: true,
+    name: existing.name,
+    version: existing.version,
+  };
+
+  // No pin → arc#354 behaviour, untouched. preExtractedPath is a registry
+  // install with no git checkout to move.
+  if (!opts.pinnedRef || opts.preExtractedPath) return noop;
+
+  const repin = await repinInstalledCheckout({
+    name: existing.name,
+    installPath: existing.install_path,
+    pinnedRef: opts.pinnedRef,
+  });
+  if (!repin.success) {
+    return { success: false, name: existing.name, error: repin.error };
+  }
+  if (!repin.moved) return noop;
+
+  // Record what a fresh pinned install would have recorded: the manifest
+  // version at the ref that is now checked out. Leaving the old version in the
+  // DB would make `arc list` describe a checkout that no longer exists.
+  const version = repin.manifest?.version ?? existing.version;
+  opts.db
+    .prepare("UPDATE skills SET version = ?, updated_at = ? WHERE name = ?")
+    .run(version, new Date().toISOString(), existing.name);
+
+  return {
+    success: true,
+    name: existing.name,
+    version,
+    manifest: repin.manifest,
+    repinned: { ref: repin.ref ?? opts.pinnedRef, from: repin.from ?? "", to: repin.to ?? "" },
   };
 }
