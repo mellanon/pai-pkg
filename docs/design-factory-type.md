@@ -1,6 +1,7 @@
 # Design: the `factory` composition type
 
-**Status:** DRAFT — decisions D1–D8 await ratification by Andreas (see #365).
+**Status:** RATIFIED 2026-09-02 (D1–D8; the four open judgement calls
+decided by Andreas — see PR discussion).
 **Date:** 2026-09-02. Every `file:line` claim below was verified against the
 named checkout on this date.
 **Anchor:** #365 (Factory: first-class support for installable factory
@@ -161,7 +162,7 @@ Composition, merging #365's product view with the skills view. All
 | cortex | runtime | MVP |
 | metafactory-cortex-adapter-discord | surface | MVP |
 | compass-core | governance: SOPs (plan-breakdown, dev loop, code review), validators, CLAUDE.md engine | MVP |
-| luna-lite (agent bundle) | the agent | MVP |
+| luna-lite (agent bundle) | the agent | optional |
 | discord (skill) | narration surface | MVP |
 | code-review (skill) | the review lane | MVP |
 | pilot-review-loop (skill) | autonomous review cycle | optional |
@@ -173,12 +174,20 @@ floors set in the implementation issue from cortex's requirements).
 `produces: software` — the capability declaration that makes this a
 *software* factory on the registry's discovery surface.
 
-**Name — DECISION FOR ANDREAS, deliberately not made here:**
-`metafactory-factory-software` (component repo convention,
-`metafactory-<kind>-<name>`) vs `the-software-factory` (#365's acceptance
-sketch). Note E6's precedent: repo-name classes and manifest types are
-independent axes, so either repo name can carry `name: software-factory`
-in the manifest.
+**MVP rationale (ratified):** the factory ships runtime + governance +
+skills; the agent is the operator's first choice on top of it, so "fresh
+machine → agent replies" becomes "fresh machine → factory ready + agent
+one install away." Note: #365's acceptance sketch includes an agent in its
+MVP composition — the ratified MVP deliberately diverges for exactly this
+reason; the sketch's end state is reached by one further `arc install` of
+the operator's chosen agent bundle.
+
+**Name — DECIDED (ratified 2026-09-02):** the repo is
+**`metafactory-factory-software`** (component repo convention,
+`metafactory-<kind>-<name>`); the manifest carries `name:
+software-factory`. Per E6's precedent, repo-name class and manifest name
+are independent axes — `arc install software-factory` is unaffected by the
+repo's conventional name.
 
 ## Out of scope
 
@@ -196,4 +205,5 @@ registry (#366 "stock the shelf" owns it) · creating the factory repo
 4. arc: publish validation for factories — exact pins, tier MIN (D4, D5).
 5. meta-factory#571 (exists): registry taxonomy.
 6. compass-core#20 (exists): plan-breakdown skill ships with its SOP.
-7. The factory repo itself (post-name-decision).
+7. The factory repo itself: `metafactory-factory-software` (name
+   ratified), manifest `name: software-factory`, MVP members per D8.
