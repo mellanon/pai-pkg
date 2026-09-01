@@ -353,14 +353,54 @@ describe("maybeProvisionAgentIdentity — install.ts hook", () => {
       if (env.agentId !== undefined) process.env.MF_AGENT_ID = env.agentId;
       await fn();
     } finally {
-      // Assigning `undefined` unsets the var under bun's process.env proxy —
-      // restores an originally-unset var without a dynamic `delete`.
-      process.env.MF_INSTANCE_DIR = prev.instance;
-      process.env.MF_NATS_DIR = prev.nats;
-      process.env.MF_SIDECAR_DIR = prev.sidecar;
-      process.env.MF_AGENT_ID = prev.agent;
+      // Restore by DELETING what was originally unset.
+      //
+      // This used to assign `undefined` and lean on bun's process.env proxy to
+      // unset the variable. Bun 1.4.0 stringifies instead, so the restore set
+      // `MF_AGENT_ID="undefined"` — a perfectly legal agent id — and leaked it
+      // into every later test in the process: agent ids resolved to
+      // "undefined", seeds landed at `undefined.nk`, and eight tests across
+      // this file, install-identity-f6b, and install-library-botpack-fanout
+      // failed on CI while passing on any machine still running bun 1.3.x.
+      // The guarded form below is what the sibling test files already use and
+      // does not depend on the proxy's behaviour either way.
+      //
+      // Spelled out per key rather than through a helper: a dynamic
+      // `delete process.env[key]` trips @typescript-eslint/no-dynamic-delete,
+      // which is what pushed the original to the `= undefined` shortcut in the
+      // first place. The sibling test files spell it out the same way.
+      if (prev.instance === undefined) delete process.env.MF_INSTANCE_DIR;
+      else process.env.MF_INSTANCE_DIR = prev.instance;
+      if (prev.nats === undefined) delete process.env.MF_NATS_DIR;
+      else process.env.MF_NATS_DIR = prev.nats;
+      if (prev.sidecar === undefined) delete process.env.MF_SIDECAR_DIR;
+      else process.env.MF_SIDECAR_DIR = prev.sidecar;
+      if (prev.agent === undefined) delete process.env.MF_AGENT_ID;
+      else process.env.MF_AGENT_ID = prev.agent;
     }
   }
+
+  test("the sandbox helper leaves no env residue behind (arc#396 CI regression guard)", async () => {
+    // The leak above was invisible to every assertion in this file: each test
+    // sandboxes its own dirs, so a stale MF_AGENT_ID only shows up as a
+    // baffling failure somewhere downstream. Assert the helper's own contract.
+    const { natsDir, agentsDir, sidecarDir } = await sandbox();
+    const before = process.env.MF_AGENT_ID;
+    await withSandboxEnv(
+      { natsDir, instanceDir: join(agentsDir, "residue"), sidecarDir, agentId: "residue" },
+      async () => {
+        expect(process.env.MF_AGENT_ID).toBe("residue");
+      },
+    );
+    expect(process.env.MF_AGENT_ID).toBe(before);
+    if (before === undefined) {
+      // Not just falsy — the key must be GONE, never the string "undefined".
+      expect("MF_AGENT_ID" in process.env).toBe(false);
+    }
+    for (const key of ["MF_INSTANCE_DIR", "MF_NATS_DIR", "MF_SIDECAR_DIR"]) {
+      expect(process.env[key]).not.toBe("undefined");
+    }
+  });
 
   test("no-op for non-agent packages", async () => {
     expect(await maybeProvisionAgentIdentity({ type: "skill", name: "Thinking" })).toBeNull();
