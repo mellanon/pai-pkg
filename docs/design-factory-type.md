@@ -1,0 +1,199 @@
+# Design: the `factory` composition type
+
+**Status:** DRAFT — decisions D1–D8 await ratification by Andreas (see #365).
+**Date:** 2026-09-02. Every `file:line` claim below was verified against the
+named checkout on this date.
+**Anchor:** #365 (Factory: first-class support for installable factory
+compositions). This document answers its six design questions and adds the
+two sections the 2026-09-02 findings comment demanded: taxonomy
+reconciliation and the first factory's member list.
+**Refs:** meta-factory `src/types/manifest.ts` +
+`design/blueprint-lifecycle/seam-contracts.md` (registry side), arc
+`src/types.ts` / `src/lib/validate-manifest.ts` / `src/lib/bundle.ts` /
+`src/commands/install.ts` / `src/commands/purge.ts` / `src/commands/audit.ts`.
+
+> **One line.** A factory is a package whose manifest declares other
+> packages: `type: factory` reuses the registry's already-specified
+> reference-composition semantics (DD-111 `bundle`), adds tool checks and a
+> `produces:` capability declaration, and gets whole-composition install,
+> audit, and purge — so `arc install <factory>` is one command, one combined
+> capability review, and one reversible decision.
+
+## Evidence base (verified 2026-09-02)
+
+| # | Fact | Where |
+|---|------|-------|
+| E1 | Registry has TWO composition types spec'd: `library` (one tarball, N artifacts) and `bundle` (reference-manifest; install walks `references[]`) | meta-factory `src/types/manifest.ts:14-38` (grounding comment), `:40-56` (union + `VALID_PACKAGE_TYPES`) |
+| E2 | `bundle` is in the registry DB schema | seam-contracts §refs: `migrations/0012_add_bundle_type.sql` ("bundle as 10th packages.type CHECK value") |
+| E3 | arc has **no** `bundle`/`references[]` install handling | grep of `src/commands/install.ts` + `src/lib/manifest.ts`: zero hits |
+| E4 | arc auto-installs declared package dependencies today | `src/commands/install.ts:250` `installPackageDependencies` walks `depends_on.packages` entries with `repo:` |
+| E5 | arc's three type enums have drifted from each other AND from the registry | `src/types.ts:6` `ArtifactType` (12 values) = `src/lib/validate-manifest.ts:63` `VALID_TYPES` (12), but `src/lib/bundle.ts:101` publish `VALID_TYPES` has only 9 (missing `system`, `process`, `governance`); registry has 10 (`playbook`, `graph`, `bundle` unknown to arc; `system`, `component`, `pipeline`, `action`, `governance` unknown to registry) |
+| E6 | arc doctrine says "bundle" is a REPO-NAME class, not a manifest type | `src/lib/validate-manifest.ts:53-62` comment: bundle-class repos (`metafactory-bundle-<name>`) declare `type: skill`/`tool` |
+| E7 | Cascade removal precedent exists, refcounted | #349 (MERGED): "cascade removal to exclusively-owned depends_on.packages (refcounted)" |
+| E8 | Purge refuses user data by name | `src/commands/purge.ts:448` "kept (user data): … — yours, arc will not touch it"; `:440` refused-escape guard |
+| E9 | Cross-tier audit warnings exist between skills | `src/commands/audit.ts:18` ("Warnings only between skills of different tiers/authors"), `:57` |
+| E10 | A type outside every enum is installed in the wild | `@the-metafactory/compass-metafactory` carries `type: governance-overlay` — legal in none of E5's enums; cf. #361 (governance type gap, CLOSED) |
+
+## D1 — `factory` is a first-class manifest type, specializing `bundle` (Q1)
+
+**Decision.** `factory` joins the type taxonomy as a third *composition*
+type. Its grounding, in the registry's own idiom (E1): **the tarball
+contains no constituent code — only the manifest, whose `references[]`
+point at published packages — plus factory-specific declarations: `tools:`
+(host binaries checked at install) and `produces:` (the capability the
+composition exists to provide).**
+
+**Against the alternatives** from #365 Q1:
+
+- *A blueprint kind / curated install sequence* puts the composition
+  outside the manifest schema — invisible to validation, to `arc list`,
+  to the registry's type axis, and to audit. Everything in D2–D6 keys off
+  the manifest; a sequence has no manifest to key off.
+- *Reusing `bundle` unmodified* loses the factory-specific fields and the
+  semantics D2/D6 attach — and would inherit the E6 naming collision
+  (below) undisambiguated.
+
+**The E6 collision, resolved.** arc's comment doctrine ("bundle is a
+repo-name class") and the registry's `bundle` manifest type (E1/E2) use the
+same word for different things. Both survive: the repo-name class
+`metafactory-bundle-<name>` remains a *naming* convention whose members
+declare ordinary installable types; the *manifest type* `bundle` (DD-111)
+is the reference-composition. Implementation must reword the
+`validate-manifest.ts:53-62` comment to name the distinction, and the docs
+gain one table stating it. `factory` sidesteps the ambiguity by not
+reusing the word.
+
+## D2 — one command, one combined capability review (Q2)
+
+**Decision.** `arc install <factory>` resolves `references[]` (each entry:
+registry name + pinned version, D4), computes the **combined capability
+surface before installing anything**, presents ONE confirmation, then
+installs members via the existing dependency machinery (E4) extended to
+reference-resolution.
+
+Aggregation rule, per capability category of the manifest schema:
+
+- `filesystem.read` / `filesystem.write`: union of member paths, deduped,
+  displayed grouped by member (the operator sees *who* wants *what*).
+- `network`: union, deduped.
+- `bash`: `allowed` is OR; `restricted_to` is the union of member lists;
+  any member with unrestricted bash marks the whole surface unrestricted —
+  and is flagged in the confirmation.
+- `secrets`: union, each attributed to its member.
+
+Honesty rule: the combined review REPLACES per-member prompts (or the "one
+command" promise dies by a thousand confirmations), so it must display the
+full union — nothing summarized away. A member manifest that fails
+validation aborts the whole install before any member lands.
+
+## D3 — lifecycle cascades across the composition (Q3)
+
+**Decision.**
+- `arc upgrade <factory>` upgrades to the factory's new release and moves
+  members to THAT release's pins (D4) — never to floating latest.
+- `arc files <factory>` lists the union of member footprints plus the
+  factory's own manifest install.
+- `arc purge <factory>` cascades per D6.
+- Member shared with another install (another factory, or standalone):
+  refcounted exactly as #349 (E7) — removed only when the last referent
+  goes.
+
+## D4 — a factory release pins member versions (Q4)
+
+**Decision.** `references[]` entries carry **exact versions** — a factory
+release is a reproducible snapshot. Ranges are refused at publish time
+(publish-side validation, E5's `bundle.ts` enum site). Rationale: the
+factory's value is "this composition, known to work together"; a floating
+member reintroduces the integration project the type exists to delete.
+Registry relationship: publishing a factory version freezes its member
+list+versions in the registry entry, so `arc install <factory>@1.2.0`
+resolves identically forever (modulo revocations, which propagate per
+DD-108).
+
+## D5 — a factory's tier is the MIN of its members' (Q5)
+
+**Decision.** Trust never averages up. A factory containing one
+`community` member is `community` at best, whatever its own tier claims —
+computed at publish AND re-checked at install (a member's tier can change
+via revocation). `arc audit` extends E9's cross-tier warnings to
+compositions: the factory's declared tier vs computed MIN, and member-pair
+warnings as today.
+
+## D6 — untangle symmetry: install is a reversible decision (Q6)
+
+**Decision** (non-negotiable per #365).
+- At install, arc records an `arc files`-style inventory snapshot of the
+  composition.
+- `arc purge <factory>` removes every member (refcounted, E7), every
+  symlink, every declared config/state — user data refused by name exactly
+  as today (E8).
+- Verification is mechanical: post-purge `arc files` diff against the
+  install-time inventory must be empty except user-data refusals —
+  test-rig assertable, and the acceptance test for the MVP (#365's
+  acceptance sketch).
+
+## D7 — taxonomy reconciliation (the E5 drift)
+
+**Decision.**
+1. arc's single source of type truth becomes `src/types.ts` `ArtifactType`;
+   `validate-manifest.ts:63` and `bundle.ts:101` derive from it (today they
+   are hand-copied and have ALREADY diverged from each other — E5).
+2. Add `bundle` and `factory` to that source (bundle install semantics land
+   with the same machinery — E3 closes for both at once).
+3. The registry adds `factory` (tracked: meta-factory#571); `playbook` and
+   `graph` remain registry-only until an arc consumer exists (documented,
+   not silently divergent).
+4. arc-only values (`system`, `component`, `pipeline`, `action`,
+   `governance`) get a documented mapping row each: publishable-to-registry
+   or arc-local, decided per type in the implementation issue — the design
+   constraint is only that the mapping be WRITTEN.
+5. `governance-overlay` (E10) is acknowledged as an out-of-enum escapee:
+   either added properly or migrated to `governance`, in the
+   implementation issue for #361's successor.
+
+## D8 — the first factory (member list + name)
+
+Composition, merging #365's product view with the skills view. All
+"exists" claims verified installable on 2026-09-02:
+
+| Member | Role in the factory | MVP? |
+|--------|--------------------|------|
+| cortex | runtime | MVP |
+| metafactory-cortex-adapter-discord | surface | MVP |
+| compass-core | governance: SOPs (plan-breakdown, dev loop, code review), validators, CLAUDE.md engine | MVP |
+| luna-lite (agent bundle) | the agent | MVP |
+| discord (skill) | narration surface | MVP |
+| code-review (skill) | the review lane | MVP |
+| pilot-review-loop (skill) | autonomous review cycle | optional |
+| art (skill) | diagrams | optional |
+| agent-state, soma | state / portable assistant core | optional |
+
+`tools:` checks: `git`, `gh`, `bun` (presence + version floor — exact
+floors set in the implementation issue from cortex's requirements).
+`produces: software` — the capability declaration that makes this a
+*software* factory on the registry's discovery surface.
+
+**Name — DECISION FOR ANDREAS, deliberately not made here:**
+`metafactory-factory-software` (component repo convention,
+`metafactory-<kind>-<name>`) vs `the-software-factory` (#365's acceptance
+sketch). Note E6's precedent: repo-name classes and manifest types are
+independent axes, so either repo name can carry `name: software-factory`
+in the manifest.
+
+## Out of scope
+
+Implementation (enums, resolver, cascade, audit — spawned as issues off
+#365 after ratification) · registry deploy (HELD) · publishing to the live
+registry (#366 "stock the shelf" owns it) · creating the factory repo
+(waits on the D8 name decision).
+
+## Implementation issues to spawn after ratification
+
+1. arc: single-source type enum + `bundle`/`factory` values (D7.1–2).
+2. arc: reference-resolution install + combined capability review (D2).
+3. arc: composition lifecycle — upgrade/files/purge cascade + inventory
+   snapshot (D3, D6).
+4. arc: publish validation for factories — exact pins, tier MIN (D4, D5).
+5. meta-factory#571 (exists): registry taxonomy.
+6. compass-core#20 (exists): plan-breakdown skill ships with its SOP.
+7. The factory repo itself (post-name-decision).
