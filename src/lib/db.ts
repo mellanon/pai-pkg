@@ -118,6 +118,16 @@ export function recordInstall(
   insertCapabilities(db, skill.name, manifest);
 }
 
+/**
+ * Recorded value for "this package may run any bash command".
+ *
+ * A sentinel rather than an absent row: absence is indistinguishable from "no
+ * bash at all", which is precisely how an unrestricted grant became invisible
+ * (arc#396 review, F7). Parenthesised so it cannot collide with a real command
+ * string in `restricted_to`.
+ */
+export const BASH_UNRESTRICTED = "(unrestricted)";
+
 /** One row of the `capabilities` table, before it is bound to a skill. */
 export interface CapabilityRow {
   type: string;
@@ -147,8 +157,19 @@ export function capabilityRows(manifest: ArcManifest): CapabilityRow[] {
   if (caps.network) {
     for (const n of caps.network) rows.push({ type: "network", value: n.host, reason: n.reason });
   }
-  if (caps.bash?.restricted_to) {
-    for (const b of caps.bash.restricted_to) rows.push({ type: "bash", value: b, reason: "" });
+  if (caps.bash?.allowed) {
+    // Bash is recorded as a capability whenever it is ALLOWED, not only when
+    // it is restricted (arc#396 review, F7). Emitting rows per `restricted_to`
+    // entry alone meant the widest possible grant — `bash: {allowed: true}`
+    // with no restriction — recorded ZERO rows, so the recorded surface said
+    // "no bash" for a package with unrestricted bash, and a
+    // restricted→unrestricted change read as a NARROWING to any set-diff over
+    // these rows. The sentinel value makes de-restriction a visible event.
+    if (caps.bash.restricted_to?.length) {
+      for (const b of caps.bash.restricted_to) rows.push({ type: "bash", value: b, reason: "" });
+    } else {
+      rows.push({ type: "bash", value: BASH_UNRESTRICTED, reason: "" });
+    }
   }
   if (caps.secrets) {
     // Fold both author shapes (bare NAME / object form) to NAME + reason so a

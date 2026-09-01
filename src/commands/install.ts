@@ -14,6 +14,7 @@ import type { Database } from "bun:sqlite";
 import { errorMessage } from "../lib/errors.js";
 import { readManifest, readLibraryArtifacts, assessRisk, formatAuthor, formatCapabilities } from "../lib/manifest.js";
 import {
+  BASH_UNRESTRICTED,
   capabilityRows,
   getSkill,
   recordedCapabilityRows,
@@ -1778,13 +1779,26 @@ function sameRepoUrl(a: string, b: string): boolean {
  * remote post-clone. `^{commit}` keeps the arc#387 pathspec collision closed:
  * a `--pin` value naming a file resolves to nothing.
  *
+ * `tagSha` is reported alongside so the caller can detect the one case this
+ * ordering cannot decide: a tag and a branch sharing a name but not a commit.
+ * `git checkout <name>` prefers the TAG while this resolver prefers the
+ * branch, and every guard downstream runs on what this returns — so an
+ * undetected disagreement means the guards validate one commit while another
+ * lands (arc#396 review, F6). The caller refuses instead of guessing.
+ *
  * Returns null when nothing resolves — the caller then hands the ref to
  * `checkoutPinnedRef`, which owns the loud, ref-listing error message.
  */
 function resolvePinCommit(
   repoPath: string,
   ref: string,
-): { candidate: string; sha: string; isBranch: boolean; originSha: string | null } | null {
+): {
+  candidate: string;
+  sha: string;
+  isBranch: boolean;
+  originSha: string | null;
+  tagSha: string | null;
+} | null {
   for (const candidate of pinRefCandidates(ref)) {
     const originSha = gitOut(repoPath, "rev-parse", "--verify", "--quiet", `origin/${candidate}^{commit}`);
     const localSha = gitOut(repoPath, "rev-parse", "--verify", "--quiet", `${candidate}^{commit}`);
@@ -1793,7 +1807,8 @@ function resolvePinCommit(
     const isBranch =
       refExists(repoPath, `refs/heads/${candidate}`) ||
       refExists(repoPath, `refs/remotes/origin/${candidate}`);
-    return { candidate, sha, isBranch, originSha: originSha || null };
+    const tagSha = gitOut(repoPath, "rev-parse", "--verify", "--quiet", `refs/tags/${candidate}^{commit}`);
+    return { candidate, sha, isBranch, originSha: originSha || null, tagSha: tagSha || null };
   }
   return null;
 }
@@ -1882,11 +1897,22 @@ async function confirmCapabilityWidening(opts: {
 }): Promise<{ ok: boolean; error?: string }> {
   const { name, pinnedRef, db, manifest, yes } = opts;
 
-  const recorded = new Set(
-    recordedCapabilityRows(db, name).map((r) => `${r.type}:${r.value}`),
-  );
+  const recordedRows = recordedCapabilityRows(db, name);
+  const recorded = new Set(recordedRows.map((r) => `${r.type}:${r.value}`));
   const incoming = capabilityRows(manifest);
-  const added = incoming.filter((r) => !recorded.has(`${r.type}:${r.value}`));
+
+  // An already-granted UNRESTRICTED bash subsumes any set of restricted bash
+  // commands, so re-restricting is a narrowing even though the rows change
+  // (arc#396 review, F7). Without this the mirror image of the de-restriction
+  // fix would prompt on every restriction — and a gate that fires on
+  // improvements teaches operators to wave it through.
+  const hadUnrestrictedBash = recorded.has(`bash:${BASH_UNRESTRICTED}`);
+
+  const added = incoming.filter((r) => {
+    if (recorded.has(`${r.type}:${r.value}`)) return false;
+    if (r.type === "bash" && hadUnrestrictedBash) return false;
+    return true;
+  });
   if (added.length === 0) return { ok: true };
 
   const addedLines = added.map((r) => `  + ${r.type}: ${r.value}${r.reason ? ` — ${r.reason}` : ""}`);
@@ -2013,6 +2039,23 @@ async function repinInstalledCheckout(opts: {
       : ` (note: \`git fetch\` failed first — ${fetch.stderr.toString().trim() || `exit ${fetch.exitCode}`})`;
 
   const target = resolvePinCommit(installPath, pinnedRef);
+
+  // Ambiguous name: a tag and a branch that disagree about which commit they
+  // mean (arc#396 review, F6). `git checkout <name>` would take the tag while
+  // this resolver takes the branch, so every guard below would validate one
+  // object and a different one would land — including the capability consent
+  // gate, which is how a wider surface could arrive unapproved. There is no
+  // safe guess here: arc names both and asks the operator to say which.
+  if (target?.isBranch && target.tagSha && target.tagSha !== target.sha) {
+    return {
+      success: false,
+      moved: false,
+      error:
+        `Refusing to re-pin '${name}': "${target.candidate}" is ambiguous — it names both a branch (${target.sha.slice(0, 7)}) and a tag (${target.tagSha.slice(0, 7)}). ` +
+        `Nothing was moved. Pin the one you mean: \`--pin refs/tags/${target.candidate}\` for the tag, \`--pin refs/heads/${target.candidate}\` for the branch, or pin the commit SHA.`,
+    };
+  }
+
   // Already there: same commit AND, when the pin names a branch, already on
   // that branch. Without the branch half, re-pinning a detached checkout to
   // the branch sitting at the same commit would report "already at that ref"
@@ -2035,12 +2078,11 @@ async function repinInstalledCheckout(opts: {
     };
   }
 
-  // Landing on the fetched tip of a branch pin means fast-forwarding the local
-  // branch. That is only safe while the local branch is an ANCESTOR of the
-  // origin tip — a diverged branch carries local commits, and destroying an
-  // operator's work as a side effect of a re-pin is the same trust break as
-  // moving a dirty tree.
-  let fastForwardTo: string | null = null;
+  // Landing on the fetched tip of a branch pin moves the local branch. That is
+  // only safe while the local branch is an ANCESTOR of the origin tip — a
+  // diverged branch carries local commits, and destroying an operator's work
+  // as a side effect of a re-pin is the same trust break as moving a dirty
+  // tree.
   if (target?.isBranch && target.originSha && refExists(installPath, `refs/heads/${target.candidate}`)) {
     const localSha = gitOut(installPath, "rev-parse", "--verify", "--quiet", `refs/heads/${target.candidate}`);
     if (localSha && localSha !== target.originSha) {
@@ -2054,11 +2096,10 @@ async function repinInstalledCheckout(opts: {
           success: false,
           moved: false,
           error:
-            `Refusing to re-pin '${name}' to ${target.candidate}: the local branch (${localSha.slice(0, 7)}) has diverged from origin/${target.candidate} (${target.originSha.slice(0, 7)}) — fast-forwarding it would discard local commits.\n` +
+            `Refusing to re-pin '${name}' to ${target.candidate}: the local branch (${localSha.slice(0, 7)}) has diverged from origin/${target.candidate} (${target.originSha.slice(0, 7)}) — moving it onto the fetched tip would discard local commits.\n` +
             `Push, reset, or remove the local branch in ${installPath}, or \`arc remove ${name}\` for a clean pinned re-install.`,
         };
       }
-      fastForwardTo = target.originSha;
     }
   }
 
@@ -2066,52 +2107,107 @@ async function repinInstalledCheckout(opts: {
   // and gate a widened capability surface. A ref arc cannot read a manifest
   // from is not installable, so refusing here (rather than after moving) keeps
   // the checkout where it is.
-  if (target) {
-    const targetManifest = await readManifestAtRef(installPath, target.sha);
-    if (!targetManifest) {
-      return {
-        success: false,
-        moved: false,
-        error: `Refusing to re-pin '${name}' to ${pinnedRef}: no readable arc-manifest.yaml at ${target.sha.slice(0, 7)}. Nothing was moved.`,
-      };
-    }
-    const consent = await confirmCapabilityWidening({
-      name,
-      pinnedRef: target.candidate,
-      db,
-      manifest: targetManifest,
-      yes: opts.yes,
-    });
-    if (!consent.ok) {
-      return { success: false, moved: false, error: consent.error };
-    }
-  }
-
-  const checkout = checkoutPinnedRef(installPath, pinnedRef);
-  if (!checkout.success) {
-    return { success: false, moved: false, error: (checkout.error ?? "checkout failed") + fetchNote };
-  }
-
-  if (fastForwardTo) {
-    // On the branch now, and the tree was verified clean above, so this is a
-    // fast-forward in everything but name.
-    const reset = Bun.spawnSync(["git", "reset", "--hard", "--quiet", fastForwardTo], {
-      cwd: installPath,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    if (reset.exitCode !== 0) {
-      const restored = restoreHead(installPath, branchBefore || headBefore);
+  if (!target) {
+    // Nothing resolved. `checkoutPinnedRef` owns the loud, ref-listing error,
+    // so let it produce one — but never let it LAND anything: an object this
+    // function did not resolve is an object none of the guards above examined.
+    const checkout = checkoutPinnedRef(installPath, pinnedRef);
+    if (checkout.success) {
+      const restoreTarget = branchBefore || headBefore;
+      const restored = restoreHead(installPath, restoreTarget);
       return {
         success: false,
         moved: false,
         error:
-          `Failed to fast-forward '${name}' onto ${fastForwardTo.slice(0, 7)}: ${reset.stderr.toString().trim()}. ` +
+          `Refusing to re-pin '${name}' to ${pinnedRef}: git checked it out but arc could not resolve it to a commit beforehand, so none of the safety checks applied to it. ` +
           (restored
-            ? `Left the checkout at ${branchBefore || headBefore.slice(0, 7)}.`
-            : `The restore to ${branchBefore || headBefore.slice(0, 7)} ALSO failed — the checkout is at ${gitOut(installPath, "rev-parse", "--short", "HEAD") || "an unknown commit"}; fix it with \`git -C ${installPath} checkout ${branchBefore || headBefore}\`.`),
+            ? `Rolled the checkout back to ${restoreTarget}.`
+            : `The rollback to ${restoreTarget} ALSO failed — fix it with \`git -C ${installPath} checkout ${restoreTarget}\`.`),
       };
     }
+    return { success: false, moved: false, error: (checkout.error ?? "checkout failed") + fetchNote };
+  }
+
+  const targetManifest = await readManifestAtRef(installPath, target.sha);
+  if (!targetManifest) {
+    return {
+      success: false,
+      moved: false,
+      error: `Refusing to re-pin '${name}' to ${pinnedRef}: no readable arc-manifest.yaml at ${target.sha.slice(0, 7)}. Nothing was moved.`,
+    };
+  }
+  const consent = await confirmCapabilityWidening({
+    name,
+    pinnedRef: target.candidate,
+    db,
+    manifest: targetManifest,
+    yes: opts.yes,
+  });
+  if (!consent.ok) {
+    return { success: false, moved: false, error: consent.error };
+  }
+
+  // Land the resolved COMMIT, not the name (arc#396 review, F6).
+  //
+  // `checkoutPinnedRef` resolves the name a second time, through git's own
+  // precedence rules, which are not this resolver's — so handing it the name
+  // reopens the gap where the guards validate one object and another lands.
+  // The name still decides HOW to land: a branch pin lands on the branch
+  // (`-B <branch> <sha>`, which is also the fast-forward the ancestry check
+  // above authorised), anything else lands detached at the SHA. The unresolved
+  // case is handled above, and is the only remaining caller of
+  // `checkoutPinnedRef` on this path (for its error message alone).
+  const landing = target.isBranch
+    ? Bun.spawnSync(["git", "checkout", "--quiet", "-B", target.candidate, target.sha, "--"], {
+        cwd: installPath,
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+    : Bun.spawnSync(["git", "checkout", "--quiet", target.sha, "--"], {
+        cwd: installPath,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+  if (landing.exitCode !== 0) {
+    const restoreTarget = branchBefore || headBefore;
+    const restored = restoreHead(installPath, restoreTarget);
+    return {
+      success: false,
+      moved: false,
+      error:
+        `Failed to check '${name}' out at ${target.candidate} (${target.sha.slice(0, 7)}): ${landing.stderr.toString().trim()}. ` +
+        (restored
+          ? `Left the checkout at ${restoreTarget}.`
+          : `The restore to ${restoreTarget} ALSO failed — the checkout is at ${gitOut(installPath, "rev-parse", "--short", "HEAD") || "an unknown commit"}; fix it with \`git -C ${installPath} checkout ${restoreTarget}\`.`),
+    };
+  }
+
+  // Re-point the branch at its remote so `git status` in the checkout keeps
+  // reading normally; `-B <branch> <sha>` sets no upstream. Best-effort — a
+  // missing upstream is cosmetic, and never a reason to fail a landed pin.
+  if (target.isBranch && target.originSha) {
+    Bun.spawnSync(
+      ["git", "branch", "--quiet", `--set-upstream-to=origin/${target.candidate}`, target.candidate],
+      { cwd: installPath, stdout: "pipe", stderr: "pipe" },
+    );
+  }
+
+  // Belt and braces: the object the guards validated must be the object on
+  // disk. If these ever disagree again, refuse loudly instead of recording a
+  // version and a capability surface for code that is not there.
+  const landedSha = gitOut(installPath, "rev-parse", "HEAD");
+  if (landedSha !== target.sha) {
+    const restoreTarget = branchBefore || headBefore;
+    const restored = restoreHead(installPath, restoreTarget);
+    return {
+      success: false,
+      moved: false,
+      error:
+        `Refusing to record a re-pin of '${name}': arc validated ${target.sha.slice(0, 7)} but the checkout landed on ${landedSha.slice(0, 7) || "an unknown commit"}. ` +
+        (restored
+          ? `Rolled the checkout back to ${restoreTarget}.`
+          : `The rollback to ${restoreTarget} ALSO failed — fix it with \`git -C ${installPath} checkout ${restoreTarget}\`.`),
+    };
   }
 
   const headAfter = gitOut(installPath, "rev-parse", "HEAD");
@@ -2156,7 +2252,7 @@ async function repinInstalledCheckout(opts: {
       success: false,
       moved: false,
       error:
-        `bun install failed for '${name}' at ${checkout.ref ?? pinnedRef} (node_modules incomplete): ${nodeDeps.error ?? "unknown error"}. ` +
+        `bun install failed for '${name}' at ${target.candidate} (node_modules incomplete): ${nodeDeps.error ?? "unknown error"}. ` +
         (restored
           ? `Rolled the checkout back to ${restoreTarget}.`
           : `The rollback to ${restoreTarget} ALSO failed — the checkout is at ${gitOut(installPath, "rev-parse", "--short", "HEAD") || "an unknown commit"}; fix it with \`git -C ${installPath} checkout ${restoreTarget}\`.`),
@@ -2194,7 +2290,7 @@ async function repinInstalledCheckout(opts: {
   return {
     success: true,
     moved,
-    ref: checkout.ref ?? pinnedRef,
+    ref: target.candidate,
     from: headBefore,
     to: headAfter,
     manifest,
