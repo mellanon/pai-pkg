@@ -170,6 +170,30 @@ function printShimPathNotice(paths: ReturnType<typeof createArcPaths>, result: A
   console.log(`Add it with: ${formatPathRepairCommand(paths.shimDir)}`);
 }
 
+/**
+ * Report an install() outcome that hit a duplicate guard (arc#354 no-op) or
+ * moved an installed checkout to a new `--pin` ref (arc#396).
+ *
+ * A re-pin is NOT "nothing to do": printing that line while the checkout moved
+ * is the exact silent-success shape arc#396 fixed, so the move gets its own
+ * line naming both commits.
+ */
+function printAlreadyInstalledOrRepinned(
+  result: Awaited<ReturnType<typeof install>>,
+  pinnedRef: string | undefined,
+): void {
+  const repin = result.repinned;
+  if (repin) {
+    const from = repin.from.slice(0, 7);
+    const to = repin.to.slice(0, 7);
+    const move = from === to ? `already at ${to}` : `${from} → ${to}`;
+    console.log(`\n✓ '${result.name}' re-pinned to ${repin.ref} (${move}) — now v${result.version}`);
+    return;
+  }
+  const at = pinnedRef ? ` at ${pinnedRef}` : "";
+  console.log(`\n✓ '${result.name}' v${result.version} already installed${at} — nothing to do`);
+}
+
 program
   .name("arc")
   .description("Agentic component package manager")
@@ -467,9 +491,10 @@ program
       // Direct git install
       const result = await install({ arc: paths, host, db, repoUrl: nameOrUrl, yes: opts.yes, artifactName, pinnedRef, skipSecrets: opts.skipSecrets, fromEnv: opts.fromEnv, secretBackend, hostOverrides: cortexSteering.hostOverrides, cortexConfigEnv: cortexSteering.cortexConfigEnv });
       if (result.success) {
-        if (result.alreadyInstalled) {
-          // arc#354: re-running install on an installed package is a no-op.
-          console.log(`\n✓ '${result.name}' v${result.version} already installed — nothing to do`);
+        if (result.alreadyInstalled || result.repinned) {
+          // arc#354: a pin-less re-run on an installed package is a no-op.
+          // arc#396: a re-run carrying --pin moved the checkout instead.
+          printAlreadyInstalledOrRepinned(result, pinnedRef);
         } else if (result.artifacts?.length) {
           console.log(`\n✅ Installed ${result.artifacts.filter(a => a.success).length} artifact(s) from ${result.name}`);
           printShimPathNotice(paths, result);
@@ -513,9 +538,10 @@ program
         cortexConfigEnv: cortexSteering.cortexConfigEnv,
       });
       if (result.success) {
-        if (result.alreadyInstalled) {
-          // arc#354: re-running install on an installed package is a no-op.
-          console.log(`✓ '${result.name}' v${result.version} already installed — nothing to do`);
+        if (result.alreadyInstalled || result.repinned) {
+          // arc#354: a pin-less re-run on an installed package is a no-op.
+          // arc#396: a re-run carrying --pin moved the checkout instead.
+          printAlreadyInstalledOrRepinned(result, pinnedRef);
         } else if (result.artifacts?.length) {
           console.log(`✅ Installed ${result.artifacts.filter(a => a.success).length} artifact(s) from ${result.name}`);
           printShimPathNotice(paths, result);

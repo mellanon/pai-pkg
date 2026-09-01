@@ -4,6 +4,7 @@ import type { Database } from "bun:sqlite";
 import type { ArcPaths, HostAdapter, LinuxSystemdHostPaths } from "../types.js";
 import { getSkill, listSkills } from "../lib/db.js";
 import { isValidSymlink } from "../lib/symlinks.js";
+import { dirtyWorktreeEntries } from "../lib/git-tree.js";
 import { readManifest } from "../lib/manifest.js";
 import { listPackageHooks, findMissingHookFiles } from "../lib/hooks.js";
 import { resolveHost, type HostOverrides } from "../lib/hosts/registry.js";
@@ -85,20 +86,12 @@ export async function verify(
     });
   }
 
-  // Check 4: Git repo clean
+  // Check 4: Git repo clean.
+  // Shares ONE definition of "dirty" with `arc install`'s arc#396 re-pin
+  // guard (src/lib/git-tree.ts) — including the filter for arc's own
+  // `bun install` leavings — so the two cannot drift.
   if (repoExists) {
-    const result = Bun.spawnSync(["git", "status", "--porcelain"], {
-      cwd: skill.install_path,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    // Filter out expected untracked files from bun install
-    const ignored = /^(\?\? |..)?(node_modules\/|bun\.lock|\.DS_Store)$/;
-    const dirtyLines = result.stdout
-      .toString()
-      .trim()
-      .split("\n")
-      .filter((l) => l && !ignored.test(l));
+    const dirtyLines = dirtyWorktreeEntries(skill.install_path);
     const isClean = dirtyLines.length === 0;
     checks.push({
       check: "Git repo clean",

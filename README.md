@@ -494,6 +494,20 @@ The `name@version` suffix form (`arc install MySkill@1.2.0`) is unchanged — it
 
 A tag pin is what `arc upgrade` already understands (a release). A branch or commit-SHA pin is **install-time only**: arc doesn't record which ref you pinned, so a later `arc upgrade <name>` moves the checkout forward same as any other install. Re-run `arc install --pin <ref>` to return to a specific ref.
 
+Re-running `--pin` on a package that is already installed moves that checkout to the ref (arc#396). It fetches first — with `--force --tags`, so a ref minted since the install resolves and a **moved tag** lands on its new commit rather than the stale local one — and resolves a branch pin through `origin/<branch>`, so an advanced branch lands on the fetched tip. Already on the pinned ref, it does nothing and says so.
+
+arc refuses, and moves nothing, when:
+
+- the checkout has **uncommitted changes** (commit, stash, or discard them, or `arc remove <name>` for a clean pinned re-install);
+- the local branch has **diverged** from its origin tip, since fast-forwarding it would discard local commits;
+- the ref **widens the package's declared capabilities** and you have not approved them — arc shows what was added and asks, and a non-interactive run without `--yes` is refused. Unrestricted bash (`bash: {allowed: true}` with no `restricted_to`) is recorded as its own capability, so dropping a bash restriction reads as the widening it is;
+- the installed package came from a **different repo URL** that merely shares a repo name;
+- the ref name is **ambiguous** — a tag and a branch that disagree about which commit they mean. `git checkout` prefers the tag and arc's resolver prefers the branch, so arc names both and asks you to pin `refs/tags/<name>`, `refs/heads/<name>`, or the SHA.
+
+What arc validates is exactly what lands: the pin is resolved to a commit once, every check runs against that commit, and the checkout targets the SHA (landing on the branch when the pin named one). A mismatch afterwards is refused rather than recorded.
+
+On a successful move arc runs `bun install` for the new ref, then records the new version and capability surface. It does **not** re-run lifecycle scripts or re-wire hooks, templates, and extensions — that is `arc upgrade`'s job.
+
 ---
 
 ## Publishing
