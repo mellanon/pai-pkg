@@ -4,12 +4,11 @@ import { cp, mkdir } from "fs/promises";
 import { homedir } from "os";
 import type { ArcPaths, HostAdapter, RulesTemplate } from "../types.js";
 import type { Database } from "bun:sqlite";
-import { listSkills, getSkill, listByLibrary } from "../lib/db.js";
+import { listSkills, getSkill, listByLibrary, replaceCapabilities } from "../lib/db.js";
 import { readManifest, readLibraryArtifacts } from "../lib/manifest.js";
 import YAML from "yaml";
 import { installSingleArtifact, installPackageDependencies } from "./install.js";
 import { createSymlink } from "../lib/symlinks.js";
-import { normalizeDeclaredSecrets } from "../lib/secrets.js";
 import { resolveProvidesTarget } from "../lib/provides-target.js";
 import { findGitRoot } from "../lib/paths.js";
 import { loadSources } from "../lib/sources.js";
@@ -622,31 +621,10 @@ export async function upgradePackage(
     "UPDATE skills SET version = ?, updated_at = ? WHERE name = ?"
   ).run(newVersion, now, name);
 
-  // Update capabilities — delete old, re-insert from new manifest
-  db.prepare("DELETE FROM capabilities WHERE skill_name = ?").run(name);
-
-  const insertCap = db.prepare(
-    "INSERT INTO capabilities (skill_name, type, value, reason) VALUES (?, ?, ?, ?)"
-  );
-  const caps = manifest.capabilities;
-  if (caps) {
-    if (caps.filesystem?.read) {
-      for (const p of caps.filesystem.read) insertCap.run(name, "fs_read", p, "");
-    }
-    if (caps.filesystem?.write) {
-      for (const p of caps.filesystem.write) insertCap.run(name, "fs_write", p, "");
-    }
-    if (caps.network) {
-      for (const n of caps.network) insertCap.run(name, "network", n.host, n.reason);
-    }
-    if (caps.bash?.restricted_to) {
-      for (const b of caps.bash.restricted_to) insertCap.run(name, "bash", b, "");
-    }
-    if (caps.secrets) {
-      // Fold both author shapes to NAME + reason (arc#363) — see db.ts.
-      for (const s of normalizeDeclaredSecrets(caps.secrets)) insertCap.run(name, "secret", s.name, s.reason);
-    }
-  }
+  // Update capabilities — delete old, re-insert from new manifest. Shares the
+  // single walk in db.ts with fresh install and arc#396's re-pin (the walk was
+  // duplicated verbatim here before that extraction).
+  replaceCapabilities(db, name, manifest);
 
   // Upgrade committed — drop the registry backup (no-op for git packages).
   commitSwap();

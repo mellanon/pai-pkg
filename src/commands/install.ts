@@ -1,6 +1,7 @@
 import { join } from "path";
+import { tmpdir } from "os";
 import { existsSync } from "fs";
-import { rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import type {
   ArcPaths,
   ArcManifest,
@@ -12,14 +13,23 @@ import type {
 import type { Database } from "bun:sqlite";
 import { errorMessage } from "../lib/errors.js";
 import { readManifest, readLibraryArtifacts, assessRisk, formatAuthor, formatCapabilities } from "../lib/manifest.js";
-import { getSkill, removeSkill } from "../lib/db.js";
+import {
+  capabilityRows,
+  getSkill,
+  recordedCapabilityRows,
+  removeSkill,
+  replaceCapabilities,
+} from "../lib/db.js";
+import { dirtyWorktreeEntries, restoreHead } from "../lib/git-tree.js";
 import { runScript, runLifecycleScripts } from "../lib/scripts.js";
 import { satisfiesRange } from "../lib/semver.js";
-import { isSemverShapedRef, pinRefCandidates } from "../lib/pin-ref.js";
+import { isSafePinRef, isSemverShapedRef, pinRefCandidates } from "../lib/pin-ref.js";
 import {
   type ArtifactSymlinkRecord,
   artifactDropPresent,
   createArtifactSymlinks,
+  installNodeDependencies,
+  reportNodeDependencyResult,
   rollbackArtifactSymlinks,
   toposortArtifacts,
 } from "../lib/artifact-installer.js";
@@ -408,6 +418,18 @@ export async function installPackageDependencies(
  */
 export async function install(opts: InstallOptions): Promise<InstallResult> {
   const { arc, host, db, repoUrl } = opts;
+
+  // Pin-ref injection guard, at the library boundary (arc#396 review, S3).
+  // The CLI checks this too, but the CLI is one of several callers — the
+  // dependency loop, `arc upgrade`, and tests all reach install() directly,
+  // and every branch below hands `pinnedRef` to `git` eventually. Defence in
+  // depth: the value never becomes argv without passing this.
+  if (opts.pinnedRef && !isSafePinRef(opts.pinnedRef)) {
+    return {
+      success: false,
+      error: `Invalid pin ref "${opts.pinnedRef}": must not start with '-' or contain whitespace or '..'.`,
+    };
+  }
 
   // 1. Clone repo (or use pre-extracted path for registry installs).
   // basename (via repoNameFromPreExtracted) is separator-safe — `split("/")`
@@ -1715,45 +1737,46 @@ function gitOut(repoPath: string, ...args: string[]): string {
   return result.exitCode === 0 ? result.stdout.toString().trim() : "";
 }
 
-/**
- * Working-tree entries that do NOT make a checkout dirty for arc's purposes.
- *
- * Byte-identical to the filter `arc verify`'s "Git repo clean" check uses
- * (src/commands/verify.ts) and for the same reason: arc itself runs `bun
- * install` inside the package checkout, so `node_modules/` and `bun.lock` are
- * arc's own leavings. Counting them as the operator's uncommitted work would
- * make the arc#396 dirty-tree refusal fire on practically every package with
- * a package.json — a guard that always trips is a guard nobody keeps.
- */
-const INSTALL_NOISE_ENTRY = /^(\?\? |..)?(node_modules\/|bun\.lock|\.DS_Store)$/;
+/** Does `rev` exist in `repoPath`? */
+function refExists(repoPath: string, rev: string): boolean {
+  return (
+    Bun.spawnSync(["git", "show-ref", "--verify", "--quiet", rev], {
+      cwd: repoPath,
+      stdout: "pipe",
+      stderr: "pipe",
+    }).exitCode === 0
+  );
+}
 
-/** Porcelain status lines for `repoPath`, minus arc's own install leavings. */
-function dirtyWorktreeEntries(repoPath: string): string[] {
-  const result = Bun.spawnSync(["git", "status", "--porcelain"], {
-    cwd: repoPath,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  if (result.exitCode !== 0) return [];
-  return result.stdout
-    .toString()
-    .trim()
-    .split("\n")
-    .filter((l) => l && !INSTALL_NOISE_ENTRY.test(l));
+/**
+ * Compare two repo URLs for "same repo" purposes.
+ *
+ * Deliberately shallow — trailing slash and a `.git` suffix are the two
+ * differences that mean nothing, and everything else (host, owner, path) is
+ * treated as significant. A looser comparison here would re-open the confused
+ * deputy this normalisation exists to close.
+ */
+function sameRepoUrl(a: string, b: string): boolean {
+  const norm = (u: string) => u.replace(/\/+$/, "").replace(/\.git$/, "");
+  return norm(a) === norm(b);
 }
 
 /**
  * Resolve a `--pin` ref to a commit SHA inside an EXISTING checkout, without
  * moving HEAD (arc#396).
  *
- * Candidate order comes from pinRefCandidates() so resolution matches what
- * `checkoutPinnedRef` will actually do. Each candidate is tried as
- * `<c>^{commit}` and then as `origin/<c>^{commit}`: `git rev-parse` does NOT
- * perform `git checkout`'s remote-tracking DWIM, so a branch that exists only
- * as `origin/<c>` post-clone would otherwise fail to resolve here even though
- * the checkout would succeed (the same trap documented on checkoutPinnedRef).
- * `^{commit}` also keeps the arc#387 pathspec collision closed: a `--pin`
- * value that names a file rather than a ref resolves to nothing.
+ * `origin/<candidate>` is tried BEFORE the bare candidate. That order is the
+ * fix for the stale-ref class the arc#396 review found: after a fetch, the
+ * remote-tracking ref is the freshest thing in the repo, while a bare local
+ * BRANCH name still resolves to whatever the last checkout left behind. Tags
+ * do not live under `origin/`, so for a tag pin the first probe simply misses
+ * and the (force-updated) local tag answers — which is why the fetch that
+ * precedes this must pass `--force`.
+ *
+ * `git rev-parse` does NOT perform `git checkout`'s remote-tracking DWIM, so
+ * probing `origin/<candidate>` also covers a branch that exists only on the
+ * remote post-clone. `^{commit}` keeps the arc#387 pathspec collision closed:
+ * a `--pin` value naming a file resolves to nothing.
  *
  * Returns null when nothing resolves — the caller then hands the ref to
  * `checkoutPinnedRef`, which owns the loud, ref-listing error message.
@@ -1761,24 +1784,138 @@ function dirtyWorktreeEntries(repoPath: string): string[] {
 function resolvePinCommit(
   repoPath: string,
   ref: string,
-): { candidate: string; sha: string; isBranch: boolean } | null {
+): { candidate: string; sha: string; isBranch: boolean; originSha: string | null } | null {
   for (const candidate of pinRefCandidates(ref)) {
-    for (const rev of [candidate, `origin/${candidate}`]) {
-      const sha = gitOut(repoPath, "rev-parse", "--verify", "--quiet", `${rev}^{commit}`);
-      if (!sha) continue;
-      const isBranch =
-        Bun.spawnSync(
-          ["git", "show-ref", "--verify", "--quiet", `refs/heads/${candidate}`],
-          { cwd: repoPath, stdout: "pipe", stderr: "pipe" },
-        ).exitCode === 0 ||
-        Bun.spawnSync(
-          ["git", "show-ref", "--verify", "--quiet", `refs/remotes/origin/${candidate}`],
-          { cwd: repoPath, stdout: "pipe", stderr: "pipe" },
-        ).exitCode === 0;
-      return { candidate, sha, isBranch };
-    }
+    const originSha = gitOut(repoPath, "rev-parse", "--verify", "--quiet", `origin/${candidate}^{commit}`);
+    const localSha = gitOut(repoPath, "rev-parse", "--verify", "--quiet", `${candidate}^{commit}`);
+    const sha = originSha || localSha;
+    if (!sha) continue;
+    const isBranch =
+      refExists(repoPath, `refs/heads/${candidate}`) ||
+      refExists(repoPath, `refs/remotes/origin/${candidate}`);
+    return { candidate, sha, isBranch, originSha: originSha || null };
   }
   return null;
+}
+
+/**
+ * Read and fully validate the manifest committed at `sha`, without touching
+ * the working tree (arc#396 review, F1).
+ *
+ * Materialises the manifest candidates into a scratch dir and runs the real
+ * `readManifest`, so schema folding, capability normalisation, and every
+ * type-specific validation apply exactly as they would after a checkout. The
+ * point is to be able to REFUSE before moving: a consent gate that fires after
+ * the state has already changed is not a gate.
+ */
+async function readManifestAtRef(
+  repoPath: string,
+  sha: string,
+): Promise<ArcManifest | null> {
+  const candidates = [
+    "arc-manifest.yaml",
+    "pai-manifest.yaml",
+    "agent/arc-manifest.yaml",
+    "agent/pai-manifest.yaml",
+  ];
+  const scratch = await mkdtemp(join(tmpdir(), "arc-repin-manifest-"));
+  try {
+    let found = false;
+    for (const rel of candidates) {
+      const show = Bun.spawnSync(["git", "show", `${sha}:${rel}`], {
+        cwd: repoPath,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (show.exitCode !== 0) continue;
+      await Bun.write(join(scratch, rel), show.stdout);
+      found = true;
+    }
+    if (!found) return null;
+    return await readManifest(scratch);
+  } catch {
+    return null;
+  } finally {
+    await rm(scratch, { recursive: true, force: true }).catch(() => {
+      /* scratch dir; best-effort */
+    });
+  }
+}
+
+/** Read one line from stdin; "" when there is no TTY to read from. */
+function readConsentLine(): Promise<string> {
+  if (!process.stdin.isTTY) return Promise.resolve("");
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    stdin.setEncoding("utf-8");
+    stdin.resume();
+    stdin.once("data", (data: string) => {
+      stdin.pause();
+      resolve(data);
+    });
+  });
+}
+
+/**
+ * Consent gate for a re-pin that WIDENS the recorded capability surface
+ * (arc#396 review, F1 / W1).
+ *
+ * A pinned move is a code swap, and code at a different ref can declare
+ * capabilities the operator never approved. arc's fresh install shows the
+ * surface before landing anything; a move that silently inherits the old
+ * approval would let `--pin` be the way around consent.
+ *
+ * Runs BEFORE the checkout — deliberately. The alternative (move, then ask,
+ * then roll back on refusal) changes state before consent and leaves a window
+ * where a crash strands the operator at an unapproved ref.
+ *
+ * Non-TTY without `--yes` reads "" and refuses, matching the install-time
+ * posture (`readLine` in install-transaction.ts, and the CLI's own non-TTY
+ * guard). Narrowing or unchanged surfaces never ask.
+ */
+async function confirmCapabilityWidening(opts: {
+  name: string;
+  pinnedRef: string;
+  db: Database;
+  manifest: ArcManifest;
+  yes?: boolean;
+}): Promise<{ ok: boolean; error?: string }> {
+  const { name, pinnedRef, db, manifest, yes } = opts;
+
+  const recorded = new Set(
+    recordedCapabilityRows(db, name).map((r) => `${r.type}:${r.value}`),
+  );
+  const incoming = capabilityRows(manifest);
+  const added = incoming.filter((r) => !recorded.has(`${r.type}:${r.value}`));
+  if (added.length === 0) return { ok: true };
+
+  const addedLines = added.map((r) => `  + ${r.type}: ${r.value}${r.reason ? ` — ${r.reason}` : ""}`);
+
+  if (yes) {
+    // Approved non-interactively, but still put the widened surface on the
+    // record — an operator reading a CI log must be able to see what changed.
+    process.stderr.write(
+      `arc: '${name}' at ${pinnedRef} widens its capabilities:\n${addedLines.join("\n")}\n`,
+    );
+    return { ok: true };
+  }
+
+  console.log(`\n⚠️  Re-pinning '${name}' to ${pinnedRef} WIDENS its capabilities:`);
+  for (const line of addedLines) console.log(line);
+  console.log(`\nFull capability surface at ${pinnedRef}:`);
+  for (const line of formatCapabilities(manifest)) console.log(line);
+  console.log(`Risk: ${assessRisk(manifest).toUpperCase()}`);
+  process.stdout.write("Allow the widened capabilities? [y/N] ");
+
+  const answer = (await readConsentLine()).trim().toLowerCase();
+  if (answer === "y") return { ok: true };
+
+  return {
+    ok: false,
+    error:
+      `Refusing to re-pin '${name}' to ${pinnedRef}: the ref widens the package's capabilities and consent was not given.\n${addedLines.join("\n")}\n` +
+      `Nothing was moved. Re-run with --yes to approve non-interactively (an interactive terminal can answer the prompt instead).`,
+  };
 }
 
 interface RepinOutcome {
@@ -1806,34 +1943,42 @@ interface RepinOutcome {
  * specific ref"), so honour the promise rather than retract it.
  *
  * Order of business, and why:
- *  1. `git fetch` first — the pin may name a ref minted after the clone. A
- *     fetch failure is NOT fatal here (an offline re-pin to an already-local
- *     ref must still work); it is remembered and appended to the checkout's
- *     error if resolution then fails, so an offline miss never masquerades as
- *     "no such ref".
- *  2. Resolve the pin to a commit and compare with HEAD. Equal → nothing to
- *     do, and (per the fix's contract) a dirty tree is not even consulted:
- *     nothing is going to move, so there is nothing to clobber.
+ *  1. `git fetch --force --tags` — the pin may name a ref minted since the
+ *     clone, and a tag may have MOVED. Without `--force`, git refuses to
+ *     update an existing local tag, so a re-tagged `v1.0.0` would resolve to
+ *     the stale commit and report success: arc#396 again, one layer down. A
+ *     fetch failure is NOT fatal (an offline re-pin to an already-local ref
+ *     must still work); it is remembered and appended to the error if
+ *     resolution then fails, so an offline miss never masquerades as "no such
+ *     ref".
+ *  2. Resolve the pin to a commit, remote-tracking ref first (see
+ *     `resolvePinCommit`), and compare with HEAD. Equal — and, for a branch
+ *     pin, already ON that branch — → nothing to do; a dirty tree is not even
+ *     consulted, because nothing is going to move.
  *  3. Refuse a dirty tree. `git checkout` would either carry the operator's
  *     edits across the move or fail halfway; arc names the path and stops.
- *  4. Reuse `checkoutPinnedRef` — the same function the fresh-clone path
- *     uses, so the `--` pathspec guard, the candidate order, and the
+ *  4. Refuse a local branch that has DIVERGED from its origin tip. Landing on
+ *     the fetched tip means fast-forwarding the local branch, and a diverged
+ *     branch carries local commits that a `reset --hard` would delete.
+ *  5. Read + validate the manifest at the target commit and run the
+ *     capability-widening consent gate — all BEFORE anything moves.
+ *  6. Reuse `checkoutPinnedRef` — the same function the fresh-clone path uses,
+ *     so the `--` pathspec guard, the candidate order, and the
  *     install-time-pin warning are identical by construction, not by
- *     duplication.
- *  5. Validate the manifest at the new ref, and roll HEAD back if it is gone.
- *     Landing on a ref with no arc-manifest.yaml would leave an installed
- *     package pointing at something arc could never have installed.
- *
- * Deliberately NOT done: re-running `bun install`, lifecycle scripts, hook
- * registration, or template regeneration. A re-pin moves code; re-wiring an
- * install is `arc upgrade`'s job.
+ *     duplication. Fast-forward the branch onto the fetched tip afterwards
+ *     when the pin named one.
+ *  7. Install the new ref's node dependencies, then record the new version and
+ *     capability surface. A dependency failure rolls the checkout back rather
+ *     than recording a move whose code cannot run.
  */
 async function repinInstalledCheckout(opts: {
   name: string;
   installPath: string;
   pinnedRef: string;
+  db: Database;
+  yes?: boolean;
 }): Promise<RepinOutcome> {
-  const { name, installPath, pinnedRef } = opts;
+  const { name, installPath, pinnedRef, db } = opts;
 
   if (!existsSync(join(installPath, ".git"))) {
     return {
@@ -1855,7 +2000,9 @@ async function repinInstalledCheckout(opts: {
   // is what keeps a rollback from silently detaching a tracking branch.
   const branchBefore = gitOut(installPath, "symbolic-ref", "--quiet", "--short", "HEAD");
 
-  const fetch = Bun.spawnSync(["git", "fetch", "--quiet", "--tags"], {
+  // `--force` is the load-bearing flag: a plain `--tags` leaves an existing
+  // local tag pointing at its old commit, and repos DO re-tag.
+  const fetch = Bun.spawnSync(["git", "fetch", "--quiet", "--force", "--tags"], {
     cwd: installPath,
     stdout: "pipe",
     stderr: "pipe",
@@ -1888,14 +2035,94 @@ async function repinInstalledCheckout(opts: {
     };
   }
 
+  // Landing on the fetched tip of a branch pin means fast-forwarding the local
+  // branch. That is only safe while the local branch is an ANCESTOR of the
+  // origin tip — a diverged branch carries local commits, and destroying an
+  // operator's work as a side effect of a re-pin is the same trust break as
+  // moving a dirty tree.
+  let fastForwardTo: string | null = null;
+  if (target?.isBranch && target.originSha && refExists(installPath, `refs/heads/${target.candidate}`)) {
+    const localSha = gitOut(installPath, "rev-parse", "--verify", "--quiet", `refs/heads/${target.candidate}`);
+    if (localSha && localSha !== target.originSha) {
+      const isAncestor =
+        Bun.spawnSync(
+          ["git", "merge-base", "--is-ancestor", localSha, target.originSha],
+          { cwd: installPath, stdout: "pipe", stderr: "pipe" },
+        ).exitCode === 0;
+      if (!isAncestor) {
+        return {
+          success: false,
+          moved: false,
+          error:
+            `Refusing to re-pin '${name}' to ${target.candidate}: the local branch (${localSha.slice(0, 7)}) has diverged from origin/${target.candidate} (${target.originSha.slice(0, 7)}) — fast-forwarding it would discard local commits.\n` +
+            `Push, reset, or remove the local branch in ${installPath}, or \`arc remove ${name}\` for a clean pinned re-install.`,
+        };
+      }
+      fastForwardTo = target.originSha;
+    }
+  }
+
+  // Consent BEFORE state change: validate the manifest at the target commit
+  // and gate a widened capability surface. A ref arc cannot read a manifest
+  // from is not installable, so refusing here (rather than after moving) keeps
+  // the checkout where it is.
+  if (target) {
+    const targetManifest = await readManifestAtRef(installPath, target.sha);
+    if (!targetManifest) {
+      return {
+        success: false,
+        moved: false,
+        error: `Refusing to re-pin '${name}' to ${pinnedRef}: no readable arc-manifest.yaml at ${target.sha.slice(0, 7)}. Nothing was moved.`,
+      };
+    }
+    const consent = await confirmCapabilityWidening({
+      name,
+      pinnedRef: target.candidate,
+      db,
+      manifest: targetManifest,
+      yes: opts.yes,
+    });
+    if (!consent.ok) {
+      return { success: false, moved: false, error: consent.error };
+    }
+  }
+
   const checkout = checkoutPinnedRef(installPath, pinnedRef);
   if (!checkout.success) {
     return { success: false, moved: false, error: (checkout.error ?? "checkout failed") + fetchNote };
   }
 
+  if (fastForwardTo) {
+    // On the branch now, and the tree was verified clean above, so this is a
+    // fast-forward in everything but name.
+    const reset = Bun.spawnSync(["git", "reset", "--hard", "--quiet", fastForwardTo], {
+      cwd: installPath,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (reset.exitCode !== 0) {
+      const restored = restoreHead(installPath, branchBefore || headBefore);
+      return {
+        success: false,
+        moved: false,
+        error:
+          `Failed to fast-forward '${name}' onto ${fastForwardTo.slice(0, 7)}: ${reset.stderr.toString().trim()}. ` +
+          (restored
+            ? `Left the checkout at ${branchBefore || headBefore.slice(0, 7)}.`
+            : `The restore to ${branchBefore || headBefore.slice(0, 7)} ALSO failed — the checkout is at ${gitOut(installPath, "rev-parse", "--short", "HEAD") || "an unknown commit"}; fix it with \`git -C ${installPath} checkout ${branchBefore || headBefore}\`.`),
+      };
+    }
+  }
+
   const headAfter = gitOut(installPath, "rev-parse", "HEAD");
   const branchAfter = gitOut(installPath, "symbolic-ref", "--quiet", "--short", "HEAD");
 
+  // Re-read from the WORKING TREE — that is what actually got installed, and
+  // it is the value a fresh pinned install would record. Defensive: the
+  // pre-move read at the same commit already validated, so a failure here
+  // means the worktree and the committed blob disagree (filters, a broken
+  // checkout). Restore and report rather than record a version arc cannot
+  // read.
   let manifest: ArcManifest | null;
   try {
     manifest = await readManifest(installPath);
@@ -1903,24 +2130,70 @@ async function repinInstalledCheckout(opts: {
     manifest = null;
   }
   if (!manifest) {
-    // Restore the pre-re-pin HEAD: a ref with no readable manifest is not
-    // something arc could have installed in the first place, so leaving the
-    // checkout parked there would strand the package.
-    Bun.spawnSync(["git", "checkout", "--quiet", branchBefore || headBefore, "--"], {
-      cwd: installPath,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const restoreTarget = branchBefore || headBefore;
+    const restored = restoreHead(installPath, restoreTarget);
     return {
       success: false,
       moved: false,
-      error: `Refusing to re-pin '${name}' to ${pinnedRef}: no readable arc-manifest.yaml at that ref. Left the checkout at ${branchBefore || headBefore.slice(0, 7)}.`,
+      error: restored
+        ? `Refusing to re-pin '${name}' to ${pinnedRef}: no readable arc-manifest.yaml in the checked-out tree. Left the checkout at ${restoreTarget}.`
+        : `Refusing to re-pin '${name}' to ${pinnedRef}: no readable arc-manifest.yaml in the checked-out tree, AND the restore to ${restoreTarget} failed — the checkout is at ${gitOut(installPath, "rev-parse", "--short", "HEAD") || "an unknown commit"}. Fix it with \`git -C ${installPath} checkout ${restoreTarget}\`.`,
     };
+  }
+
+  // The code moved, so its dependencies must move with it — otherwise a
+  // re-pin is not equivalent to remove + pinned re-install, which is the whole
+  // claim `--pin` makes. Same shared helper (and the same frozen-lockfile /
+  // stale-lockfile retry) as fresh install and upgrade; idempotent by
+  // construction. A genuine failure rolls the checkout back instead of
+  // recording a move whose code cannot run — the posture upgrade.ts takes.
+  const nodeDeps = installNodeDependencies(installPath);
+  reportNodeDependencyResult(nodeDeps, name, Boolean(opts.yes));
+  if (nodeDeps.ran && !nodeDeps.success) {
+    const restoreTarget = branchBefore || headBefore;
+    const restored = restoreHead(installPath, restoreTarget);
+    return {
+      success: false,
+      moved: false,
+      error:
+        `bun install failed for '${name}' at ${checkout.ref ?? pinnedRef} (node_modules incomplete): ${nodeDeps.error ?? "unknown error"}. ` +
+        (restored
+          ? `Rolled the checkout back to ${restoreTarget}.`
+          : `The rollback to ${restoreTarget} ALSO failed — the checkout is at ${gitOut(installPath, "rev-parse", "--short", "HEAD") || "an unknown commit"}; fix it with \`git -C ${installPath} checkout ${restoreTarget}\`.`),
+    };
+  }
+
+  const moved = headAfter !== headBefore || branchAfter !== branchBefore;
+
+  if (moved) {
+    // Recorded HERE, in the same function, immediately after the last step
+    // that can fail — so the window between "the checkout moved" and "the DB
+    // says so" is a few statements wide rather than a return trip through the
+    // caller (arc#396 review, F5).
+    //
+    // That window is still not atomic: SQLite holds the row and git holds the
+    // checkout, and a process killed between them leaves a DB row describing
+    // the OLD version of a checkout that has already moved. It self-heals on
+    // the next command that re-derives from the tree — `arc upgrade`, or a
+    // re-pin to a different ref — and `arc verify` surfaces the mismatch in
+    // the meantime. A real fix needs the checkout inside the install
+    // transaction (install-transaction.ts), which is a larger change than
+    // this bug fix should carry.
+    const now = new Date().toISOString();
+    db.prepare("UPDATE skills SET version = ?, updated_at = ? WHERE name = ?").run(
+      manifest.version,
+      now,
+      name,
+    );
+    // The recorded capability surface must describe the code that is now
+    // checked out (arc#396 review, F1) — same delete + re-insert `arc upgrade`
+    // performs, through the same shared helper.
+    replaceCapabilities(db, name, manifest);
   }
 
   return {
     success: true,
-    moved: headAfter !== headBefore || branchAfter !== branchBefore,
+    moved,
     ref: checkout.ref ?? pinnedRef,
     from: headBefore,
     to: headAfter,
@@ -1938,7 +2211,7 @@ async function repinInstalledCheckout(opts: {
  * identical: whether a `--pin` is honoured or ignored.
  */
 async function repinOrNoop(
-  existing: { name: string; version: string; install_path: string },
+  existing: { name: string; version: string; install_path: string; repo_url: string },
   opts: InstallOptions,
 ): Promise<InstallResult> {
   const noop: InstallResult = {
@@ -1952,28 +2225,39 @@ async function repinOrNoop(
   // install with no git checkout to move.
   if (!opts.pinnedRef || opts.preExtractedPath) return noop;
 
+  // Confused-deputy guard (arc#396 review, F4). The repo-NAME duplicate guard
+  // matches on a basename (`repo_url.endsWith(repoName)`), and two different
+  // repos can share one. Moving the installed repo's checkout to a ref named
+  // by a DIFFERENT repo is arc acting on repo A because the caller named repo
+  // B — so when the URLs disagree, refuse and name both rather than guess.
+  if (!sameRepoUrl(existing.repo_url, opts.repoUrl)) {
+    return {
+      success: false,
+      name: existing.name,
+      error:
+        `Refusing to re-pin '${existing.name}': the installed package came from ${existing.repo_url}, but this install names ${opts.repoUrl}. ` +
+        `They share a repo name, not a repo. Nothing was moved — \`arc remove ${existing.name}\` first if you meant to replace it.`,
+    };
+  }
+
   const repin = await repinInstalledCheckout({
     name: existing.name,
     installPath: existing.install_path,
     pinnedRef: opts.pinnedRef,
+    db: opts.db,
+    yes: opts.yes,
   });
   if (!repin.success) {
     return { success: false, name: existing.name, error: repin.error };
   }
   if (!repin.moved) return noop;
 
-  // Record what a fresh pinned install would have recorded: the manifest
-  // version at the ref that is now checked out. Leaving the old version in the
-  // DB would make `arc list` describe a checkout that no longer exists.
-  const version = repin.manifest?.version ?? existing.version;
-  opts.db
-    .prepare("UPDATE skills SET version = ?, updated_at = ? WHERE name = ?")
-    .run(version, new Date().toISOString(), existing.name);
-
   return {
     success: true,
     name: existing.name,
-    version,
+    // Recorded by repinInstalledCheckout at the moment of the move; reported
+    // here as the manifest version at the ref now checked out.
+    version: repin.manifest?.version ?? existing.version,
     manifest: repin.manifest,
     repinned: { ref: repin.ref ?? opts.pinnedRef, from: repin.from ?? "", to: repin.to ?? "" },
   };

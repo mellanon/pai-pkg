@@ -115,42 +115,88 @@ export function recordInstall(
   );
 
   // Record capabilities
-  const insertCap = db.prepare(`
-    INSERT INTO capabilities (skill_name, type, value, reason)
-    VALUES (?, ?, ?, ?)
-  `);
+  insertCapabilities(db, skill.name, manifest);
+}
 
+/** One row of the `capabilities` table, before it is bound to a skill. */
+export interface CapabilityRow {
+  type: string;
+  value: string;
+  reason: string;
+}
+
+/**
+ * The capability rows a manifest declares, in one place.
+ *
+ * Extracted (arc#396) because this walk existed verbatim in `recordInstall`
+ * and again in `upgradePackage`, and the arc#396 re-pin needed a third copy —
+ * plus a way to COMPARE a manifest's surface against what is already recorded,
+ * which a walk that inserts as it goes cannot give you.
+ */
+export function capabilityRows(manifest: ArcManifest): CapabilityRow[] {
   const caps = manifest.capabilities;
-  if (!caps) return;
+  if (!caps) return [];
 
+  const rows: CapabilityRow[] = [];
   if (caps.filesystem?.read) {
-    for (const p of caps.filesystem.read) {
-      insertCap.run(skill.name, "fs_read", p, "");
-    }
+    for (const p of caps.filesystem.read) rows.push({ type: "fs_read", value: p, reason: "" });
   }
   if (caps.filesystem?.write) {
-    for (const p of caps.filesystem.write) {
-      insertCap.run(skill.name, "fs_write", p, "");
-    }
+    for (const p of caps.filesystem.write) rows.push({ type: "fs_write", value: p, reason: "" });
   }
   if (caps.network) {
-    for (const n of caps.network) {
-      insertCap.run(skill.name, "network", n.host, n.reason);
-    }
+    for (const n of caps.network) rows.push({ type: "network", value: n.host, reason: n.reason });
   }
   if (caps.bash?.restricted_to) {
-    for (const b of caps.bash.restricted_to) {
-      insertCap.run(skill.name, "bash", b, "");
-    }
+    for (const b of caps.bash.restricted_to) rows.push({ type: "bash", value: b, reason: "" });
   }
   if (caps.secrets) {
     // Fold both author shapes (bare NAME / object form) to NAME + reason so a
     // manifest declaring the object form records the same rows as the shorthand
     // (arc#363) — the value column is always a string, never "[object Object]".
     for (const s of normalizeDeclaredSecrets(caps.secrets)) {
-      insertCap.run(skill.name, "secret", s.name, s.reason);
+      rows.push({ type: "secret", value: s.name, reason: s.reason });
     }
   }
+  return rows;
+}
+
+/** Insert a manifest's capability rows for `name` (no delete first). */
+export function insertCapabilities(
+  db: Database,
+  name: string,
+  manifest: ArcManifest
+): void {
+  const insertCap = db.prepare(`
+    INSERT INTO capabilities (skill_name, type, value, reason)
+    VALUES (?, ?, ?, ?)
+  `);
+  for (const row of capabilityRows(manifest)) {
+    insertCap.run(name, row.type, row.value, row.reason);
+  }
+}
+
+/**
+ * Replace the recorded capability surface for `name` with the manifest's.
+ *
+ * The recorded surface is what `arc audit` / `arc info` show an operator, so
+ * it has to describe the code that is actually checked out. Any command that
+ * moves a package's code (upgrade, arc#396's re-pin) owes this call.
+ */
+export function replaceCapabilities(
+  db: Database,
+  name: string,
+  manifest: ArcManifest
+): void {
+  db.prepare("DELETE FROM capabilities WHERE skill_name = ?").run(name);
+  insertCapabilities(db, name, manifest);
+}
+
+/** The capability surface currently RECORDED for `name`. */
+export function recordedCapabilityRows(db: Database, name: string): CapabilityRow[] {
+  return db
+    .prepare("SELECT type, value, reason FROM capabilities WHERE skill_name = ?")
+    .all(name) as CapabilityRow[];
 }
 
 /**
