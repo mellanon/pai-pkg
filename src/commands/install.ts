@@ -1,7 +1,7 @@
 import { join } from "path";
 import { tmpdir } from "os";
 import { existsSync } from "fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rename, rm } from "node:fs/promises";
 import type {
   ArcPaths,
   ArcManifest,
@@ -106,7 +106,11 @@ import {
   isCompositionType,
   prepareComposition,
 } from "../lib/composition.js";
-import { recordComposition } from "../lib/db.js";
+import {
+  beginComposition,
+  completeComposition,
+  markCompositionMemberLanded,
+} from "../lib/db.js";
 import { loadSources } from "../lib/sources.js";
 import { fetchAndVerifyRegistryPackage, parsePackageRef } from "../lib/registry-install.js";
 
@@ -669,12 +673,18 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
   // only reachable because resolution and installation are separate phases.
   let compositionPlan: CompositionPlan | undefined;
   if (isCompositionType(manifest.type)) {
+    // Self-heal any `.compose-*` scratch left by a previous crashed run before
+    // staging anything new (W3).
+    await sweepOrphanedStagingDirs(arc.reposDir);
+
     const prepared = await prepareComposition({
       manifest,
       seams: defaultCompositionSeams(opts),
       yes: opts.yes,
     });
     if (!prepared.ok) {
+      // W3: staged bytes never outlive the refusal that rejected them.
+      await sweepStagedMembers(prepared.staged);
       if (!opts.preExtractedPath) {
         await rm(installPath, { recursive: true, force: true }).catch(() => {
           /* best-effort; the refusal is the error worth surfacing */
@@ -747,11 +757,37 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
   // partially-installed composition is the lifecycle slice's job (arc#401, D6).
   if (compositionPlan?.members.length) {
     const seams = defaultCompositionSeams(opts);
+
+    // F3: OPEN the composition record before the first member lands. From here
+    // an interruption — a kill, a member failing at runtime — is visible as an
+    // incomplete composition rather than as anonymous member packages and no
+    // trace of the factory. See the `compositions` schema comment in db.ts.
+    beginComposition(
+      db,
+      manifest.name,
+      manifest.version,
+      compositionRecordFor(compositionPlan),
+    );
+
     const membersResult = await installCompositionMembers(compositionPlan, seams.installMember, {
       yes: opts.yes,
       log: seams.log,
+      warn: seams.warn,
+      // F2: the surface arc RECORDS for a landed member, checked against the
+      // surface the operator approved. Bound here because composition.ts owns
+      // no database, deliberately.
+      recordedRowsFor: (name) => recordedCapabilityRows(db, name),
+      reviewedRowsFor: (member) => capabilityRows(member.manifest),
+      onMemberLanded: (member) => {
+        markCompositionMemberLanded(db, manifest.name, member.reference.name);
+      },
     });
     if (!membersResult.success) {
+      // The record stays `pending`, naming exactly which members landed — that
+      // IS the report. Staged bytes for members that never landed are swept.
+      await sweepStagedMembers(
+        compositionPlan.members.filter((m) => !membersResult.landed.includes(m.reference.name)),
+      );
       return { success: false, error: membersResult.error };
     }
   }
@@ -960,9 +996,12 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
   // returning first and leaving a composition installed but unrecorded.
   //
   // Written for arc#401 to consume — see the `composition_members` schema
-  // comment in lib/db.ts.
+  // comment in lib/db.ts. The membership itself was written by
+  // `beginComposition` before the members landed (F3); this is the CLOSE that
+  // flips the record from `pending` to `complete`, and it is the only thing
+  // that distinguishes a finished composition from an interrupted one.
   if (compositionPlan?.members.length) {
-    recordComposition(db, manifest.name, compositionRecordFor(compositionPlan));
+    completeComposition(db, manifest.name);
   }
 
   // F-6b (arc#228) — IDENTITY STEP. For type:agent packages, provision the
@@ -2087,7 +2126,30 @@ async function resolveRegistryReference(
   };
 }
 
-async function resolveRepoReference(
+/**
+ * Resolve a `repo:` member: shallow-clone at the tag for the pinned version,
+ * read its manifest, and pin the member install to the resolved COMMIT.
+ *
+ * ## Why the pin is a SHA, not the tag (arc#400 review, F2)
+ *
+ * A tag is a mutable label. Consent is read here, from a scratch clone; the
+ * member then lands from a SECOND, independent clone. Handing that second clone
+ * the tag NAME reopens the window between them: `git tag -f v1.0.0` in between
+ * and the operator approves one commit while a different one installs. The
+ * version-equality check does not close it — that compares a number in a
+ * manifest, and the attacker controls the manifest too.
+ *
+ * So the candidate tag is used only to FIND the commit; what travels onward is
+ * `git rev-parse HEAD`, and consent is bound to the bytes rather than to the
+ * label that happened to point at them. `install()` resolves and checks out
+ * commit SHAs robustly (arc#396/#403), so this costs nothing but the extra
+ * `rev-parse`. `installCompositionMembers` then verifies the landed surface
+ * against the reviewed one as a second, route-independent check.
+ *
+ * Exported for the moved-tag regression test, which runs this real resolver and
+ * moves the tag between resolution and landing.
+ */
+export async function resolveRepoReference(
   reference: PackageReference,
   repoUrl: string,
 ): Promise<{ ok: true; member: ResolvedCompositionMember } | { ok: false; error: string }> {
@@ -2097,7 +2159,6 @@ async function resolveRepoReference(
 
   try {
     let cloned = false;
-    let pinnedRef: string | undefined;
     let lastError = "";
     for (const candidate of candidates) {
       const result = Bun.spawnSync(
@@ -2106,7 +2167,6 @@ async function resolveRepoReference(
       );
       if (result.exitCode === 0) {
         cloned = true;
-        pinnedRef = candidate;
         break;
       }
       lastError = result.stderr.toString().trim();
@@ -2121,6 +2181,20 @@ async function resolveRepoReference(
           `(tried ${candidates.join(", ")}) — a factory member must be reachable at its exact pin (D4). ${lastError}`,
       };
     }
+
+    // The commit the review is about. From here the tag is irrelevant.
+    const revParse = Bun.spawnSync(["git", "rev-parse", "HEAD"], {
+      cwd: checkout,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (revParse.exitCode !== 0) {
+      return {
+        ok: false,
+        error: `could not resolve a commit for ${reference.version} in ${repoUrl}: ${revParse.stderr.toString().trim()}`,
+      };
+    }
+    const pinnedRef = revParse.stdout.toString().trim();
 
     let manifest: ArcManifest | null;
     try {
@@ -2144,6 +2218,49 @@ async function resolveRepoReference(
   }
 }
 
+/** The scratch prefix every staged composition member is extracted under. */
+const COMPOSE_STAGING_PREFIX = ".compose-";
+
+/**
+ * Delete the staged directories a set of resolved members is holding
+ * (arc#400 review, W3).
+ *
+ * Staging places bytes but nothing else — no symlink, no DB row, no host drop —
+ * so a refusal after staging still satisfies the honesty rule. It does leave
+ * the bytes, though, and bytes a refusal leaves behind are the next run's
+ * confusing state. Best-effort: a sweep failure must never mask the refusal
+ * that caused it.
+ */
+async function sweepStagedMembers(members: readonly ResolvedCompositionMember[]): Promise<void> {
+  for (const member of members) {
+    if (!member.preExtractedPath) continue;
+    await rm(member.preExtractedPath, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Remove `.compose-*` leftovers in `reposDir` before staging anything new.
+ *
+ * `sweepStagedMembers` handles every refusal arc controls; this handles the one
+ * it does not — a crash or a kill mid-resolution. Same self-healing posture as
+ * `pruneKnownDeadSources` (sources.ts): the mess clears itself on the next run
+ * instead of needing a documented manual step. Safe because a staged dir is
+ * scratch by construction and concurrent composition installs are not a
+ * supported scenario.
+ */
+async function sweepOrphanedStagingDirs(reposDir: string): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await readdir(reposDir);
+  } catch {
+    return; // reposDir may not exist yet
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(COMPOSE_STAGING_PREFIX)) continue;
+    await rm(join(reposDir, entry), { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 /**
  * Install one resolved member through the ORDINARY install path.
  *
@@ -2158,6 +2275,18 @@ async function resolveRepoReference(
  * capabilities, as part of the one combined review D2 promises. Re-prompting
  * per member here is precisely the death-by-a-thousand-confirmations the
  * combined review exists to prevent.
+ *
+ * ## The staging rename (arc#400 review, W2)
+ *
+ * A registry member is verified into `.compose-<scope>__<name>@<version>` — a
+ * scratch name, so a refusal mid-resolution leaves something obviously
+ * sweepable rather than something that looks installed. Immediately before it
+ * is handed to `install()` it is renamed to `<scope>__<name>`, the SAME name
+ * `arc install @scope/name` extracts to. Two reasons: a version-stamped install
+ * directory goes stale the moment the member is upgraded (arc#401 walks these
+ * paths and would find a directory whose name disagrees with the version
+ * installed in it), and a member installed as part of a composition should be
+ * indistinguishable on disk from the same member installed by hand.
  */
 function createMemberInstaller(ctx: {
   arc: ArcPaths;
@@ -2166,19 +2295,47 @@ function createMemberInstaller(ctx: {
   hostOverrides?: HostOverrides;
 }) {
   return async (member: ResolvedCompositionMember) => {
+    let preExtractedPath = member.preExtractedPath;
+
+    if (preExtractedPath) {
+      const ref = parsePackageRef(`${member.ref}@${member.reference.version}`);
+      if (ref) {
+        const target = join(ctx.arc.reposDir, `${ref.scope}__${ref.name}`);
+        if (target !== preExtractedPath) {
+          // A pre-existing dir here is a stale extract for the same package —
+          // install()'s duplicate guards (which run after this, on the DB) are
+          // what protect a real install; an orphan directory is just debris.
+          await rm(target, { recursive: true, force: true }).catch(() => undefined);
+          try {
+            await rename(preExtractedPath, target);
+            preExtractedPath = target;
+            member.preExtractedPath = target; // keep the sweep pointed at reality
+          } catch {
+            // Rename failed (cross-device, permissions). The staged dir is still
+            // a perfectly good source; carry on with the scratch name rather
+            // than failing an install over a cosmetic path.
+          }
+        }
+      }
+    }
+
     const result = await install({
       arc: ctx.arc,
       host: ctx.host,
       db: ctx.db,
-      repoUrl: member.preExtractedPath
-        ? `${member.ref}@${member.reference.version}`
-        : member.ref,
+      repoUrl: preExtractedPath ? `${member.ref}@${member.reference.version}` : member.ref,
       yes: true,
-      preExtractedPath: member.preExtractedPath,
-      pinnedRef: member.preExtractedPath ? undefined : member.pinnedRef,
+      preExtractedPath,
+      pinnedRef: preExtractedPath ? undefined : member.pinnedRef,
       hostOverrides: ctx.hostOverrides,
     });
-    return { success: result.success, error: result.error, version: result.version };
+    return {
+      success: result.success,
+      error: result.error,
+      name: result.name,
+      version: result.version,
+      alreadyInstalled: result.alreadyInstalled,
+    };
   };
 }
 

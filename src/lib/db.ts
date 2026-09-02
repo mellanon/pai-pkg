@@ -96,8 +96,26 @@ export function openDatabase(dbPath: string): Database {
   // refcounted per arc#349. Nothing else is stored here on purpose — the
   // install-time inventory snapshot D6 asks for is #401's to design, and a
   // half-guessed schema for it now would be one #401 has to migrate away from.
-  // The FK cascade means removing the composition row removes its membership,
-  // so a `arc remove <factory>` can never leave orphaned member rows behind.
+  //
+  // ── WHY THE HEADER IS NOT FK'd TO `skills` (arc#400 review, F3) ───────────
+  // The composition record is written BEFORE the first member installs and
+  // finalized after the composition's own row commits, so that a run killed in
+  // between — or a member failing at runtime — leaves a visible INCOMPLETE
+  // composition rather than a set of member packages that look standalone and a
+  // factory that was never here. A FK to `skills` would forbid exactly that:
+  // the skills row does not exist yet at the moment the record must be written.
+  // `removeSkill` therefore deletes the header explicitly; membership cascades
+  // off the header, so `arc remove <factory>` still leaves nothing orphaned.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS compositions (
+      name TEXT PRIMARY KEY,
+      version TEXT NOT NULL,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+
   db.run(`
     CREATE TABLE IF NOT EXISTS composition_members (
       composition_name TEXT NOT NULL,
@@ -106,12 +124,29 @@ export function openDatabase(dbPath: string): Database {
       member_source TEXT NOT NULL,
       member_ref TEXT NOT NULL,
       position INTEGER NOT NULL,
+      state TEXT NOT NULL DEFAULT 'pending',
       PRIMARY KEY (composition_name, member_name),
-      FOREIGN KEY (composition_name) REFERENCES skills(name) ON DELETE CASCADE
+      FOREIGN KEY (composition_name) REFERENCES compositions(name) ON DELETE CASCADE
     );
   `);
 
   return db;
+}
+
+/** Lifecycle of a composition install: in flight, or finished. */
+export type CompositionStatus = "pending" | "complete";
+
+/** The header row for a composition install (arc#400). */
+export interface CompositionRow {
+  name: string;
+  version: string;
+  /**
+   * `pending` — members are landing, or the install was interrupted before the
+   * composition's own row committed. `complete` — everything landed.
+   */
+  status: CompositionStatus;
+  started_at: string;
+  updated_at: string;
 }
 
 /** One row of `composition_members` — a pinned member of a bundle/factory. */
@@ -125,38 +160,89 @@ export interface CompositionMemberRow {
   member_ref: string;
   /** Declaration order in `references[]`, preserved for reproducibility. */
   position: number;
+  /** `pending` until the member actually lands, then `landed` (arc#400 F3). */
+  state: string;
 }
 
 /**
- * Record the composition an install resolved, replacing any previous one for
- * the same name (arc#400 D2/D4).
+ * OPEN a composition install: write the header and the intended membership as
+ * `pending`, BEFORE the first member lands (arc#400 review, F3).
  *
- * Replace-not-merge: the composition IS the release's member list, so an
- * upgrade that drops a member must drop its row too. Runs in a transaction so
- * a composition is never observable half-rewritten.
+ * This is the whole point of the two-phase record. Members land one at a time
+ * and the composition's own `skills` row commits last, so the window between
+ * them is real: a kill, a power loss, or a member failing at runtime used to
+ * leave the landed members looking like ordinary standalone packages and no
+ * trace that a composition was ever attempted. `arc list` then lied by
+ * omission, and arc#401's cascade had nothing to sweep. Now that window is a
+ * `pending` record naming exactly which members landed and which did not.
+ *
+ * Replace-not-merge: a re-run after a failed attempt starts a fresh record,
+ * because the composition IS the release's member list.
  */
-export function recordComposition(
+export function beginComposition(
   db: Database,
   compositionName: string,
-  members: readonly {
-    name: string;
-    version: string;
-    source: string;
-    ref: string;
-  }[],
+  version: string,
+  members: readonly { name: string; version: string; source: string; ref: string }[],
 ): void {
-  const insert = db.prepare(`
+  const now = new Date().toISOString();
+  const insertMember = db.prepare(`
     INSERT INTO composition_members
-      (composition_name, member_name, member_version, member_source, member_ref, position)
-    VALUES (?, ?, ?, ?, ?, ?)
+      (composition_name, member_name, member_version, member_source, member_ref, position, state)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending')
   `);
   const tx = db.transaction(() => {
+    // Membership cascades off the header, but delete it explicitly so the order
+    // is obvious rather than relying on the cascade firing mid-transaction.
     db.prepare("DELETE FROM composition_members WHERE composition_name = ?").run(compositionName);
+    db.prepare("DELETE FROM compositions WHERE name = ?").run(compositionName);
+    db.prepare(
+      "INSERT INTO compositions (name, version, status, started_at, updated_at) VALUES (?, ?, 'pending', ?, ?)",
+    ).run(compositionName, version, now, now);
     members.forEach((member, position) => {
-      insert.run(compositionName, member.name, member.version, member.source, member.ref, position);
+      insertMember.run(
+        compositionName,
+        member.name,
+        member.version,
+        member.source,
+        member.ref,
+        position,
+      );
     });
   });
   tx();
+}
+
+/** Mark one member as landed (arc#400 F3). No-op for an unknown member. */
+export function markCompositionMemberLanded(
+  db: Database,
+  compositionName: string,
+  memberName: string,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    "UPDATE composition_members SET state = 'landed' WHERE composition_name = ? AND member_name = ?",
+  ).run(compositionName, memberName);
+  db.prepare("UPDATE compositions SET updated_at = ? WHERE name = ?").run(now, compositionName);
+}
+
+/**
+ * CLOSE a composition install: everything landed and the composition's own row
+ * has committed (arc#400 review, F3).
+ */
+export function completeComposition(db: Database, compositionName: string): void {
+  const now = new Date().toISOString();
+  db.prepare("UPDATE compositions SET status = 'complete', updated_at = ? WHERE name = ?").run(
+    now,
+    compositionName,
+  );
+}
+
+/** The header row for `compositionName`, or null when there is none. */
+export function compositionRecord(db: Database, compositionName: string): CompositionRow | null {
+  return db
+    .prepare("SELECT * FROM compositions WHERE name = ?")
+    .get(compositionName) as CompositionRow | null;
 }
 
 /** The pinned members of `compositionName`, in declaration order. */
@@ -168,16 +254,24 @@ export function compositionMembers(db: Database, compositionName: string): Compo
     .all(compositionName) as CompositionMemberRow[];
 }
 
-/** Every recorded composition, keyed by composition name (for `arc list`). */
-export function allCompositions(db: Database): Map<string, CompositionMemberRow[]> {
+/**
+ * Every recorded composition — header plus membership — keyed by name.
+ *
+ * Includes `pending` ones, which is the point: an interrupted install has no
+ * `skills` row, so this is the ONLY place `arc list` can see it (F3).
+ */
+export function allCompositions(
+  db: Database,
+): Map<string, { record: CompositionRow; members: CompositionMemberRow[] }> {
+  const headers = db.prepare("SELECT * FROM compositions ORDER BY name").all() as CompositionRow[];
   const rows = db
     .prepare("SELECT * FROM composition_members ORDER BY composition_name, position")
     .all() as CompositionMemberRow[];
-  const byName = new Map<string, CompositionMemberRow[]>();
+
+  const byName = new Map<string, { record: CompositionRow; members: CompositionMemberRow[] }>();
+  for (const header of headers) byName.set(header.name, { record: header, members: [] });
   for (const row of rows) {
-    const existing = byName.get(row.composition_name) ?? [];
-    existing.push(row);
-    byName.set(row.composition_name, existing);
+    byName.get(row.composition_name)?.members.push(row);
   }
   return byName;
 }
@@ -358,6 +452,12 @@ export function updateSkillStatus(
  */
 export function removeSkill(db: Database, name: string): void {
   db.prepare("DELETE FROM skills WHERE name = ?").run(name);
+  // arc#400: a composition's header row is deliberately NOT FK'd to `skills`
+  // (it must exist before that row does, so an interrupted install stays
+  // visible — see the schema comment), so removing the package has to remove it
+  // explicitly. Membership cascades off the header, so this is the whole
+  // teardown. A no-op for every non-composition package.
+  db.prepare("DELETE FROM compositions WHERE name = ?").run(name);
 }
 
 /**

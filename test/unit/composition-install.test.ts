@@ -389,14 +389,18 @@ describe("arc#400 AC — one command installs the whole composition", () => {
 
     // `arc list --json` exposes the composition — the shape #401 consumes.
     const json = JSON.parse(formatListJson(list(env.db))) as {
-      packages: { name: string; composition?: { members: { name: string; version: string }[] } }[];
+      packages: {
+        name: string;
+        composition?: { status: string; members: Record<string, string>[] };
+      }[];
     };
     const factoryEntry = json.packages.find((p) => p.name === "software-factory")!;
     expect(factoryEntry.composition).toBeDefined();
+    expect(factoryEntry.composition!.status).toBe("complete");
     expect(factoryEntry.composition!.members).toEqual([
-      { name: "alpha", version: "1.0.0", source: "repo", ref: alpha.url },
-      { name: "beta", version: "2.1.0", source: "repo", ref: beta.url },
-    ] as unknown as { name: string; version: string }[]);
+      { name: "alpha", version: "1.0.0", source: "repo", ref: alpha.url, state: "landed" },
+      { name: "beta", version: "2.1.0", source: "repo", ref: beta.url, state: "landed" },
+    ]);
     // A non-composition package carries no composition key at all.
     expect(json.packages.find((p) => p.name === "alpha")!.composition).toBeUndefined();
   }, 60_000);

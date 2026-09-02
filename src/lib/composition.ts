@@ -78,17 +78,42 @@ export function isCompositionType(type: string | undefined): type is Composition
 // ───────────────────────────────────────────────────────────────────────────
 
 /**
- * A fully-specified semver — the ONLY thing `references[].version` accepts.
+ * An EXACT pin: BYTE-FOR-BYTE the registry's storage grammar, from
+ * meta-factory `src/lib/semver.ts` — `/^(\d+)\.(\d+)\.(\d+)(?:-([a-zA-Z0-9.]+))?$/`
+ * — read on 2026-09-02, not assumed.
  *
- * Intentionally the same literal as `validate-manifest.ts`'s SEMVER_RE: a
- * reference pin and a package's own `version:` are the same vocabulary, and a
- * pin that could never match a published version would be a trap.
+ * A pin is "exact" when it names a version the registry can actually HOLD, so
+ * the registry's grammar IS the definition; anything arc invents on top is a
+ * place the two gates can disagree. Two consequences, pointing in opposite
+ * directions, and both deliberate:
+ *
+ *   - TIGHTER than arc's first cut, which allowed a hyphen inside the
+ *     prerelease (`1.2.3-rc-1`). The registry's prerelease class is
+ *     `[a-zA-Z0-9.]+` with no hyphen, so arc was accepting pins that could
+ *     never resolve.
+ *   - DELIBERATELY NOT tightened against leading zeros (`1.02.3`). SemVer 2.0.0
+ *     forbids them; the registry's `\d+` does not, so `1.02.3` is a version it
+ *     can store and resolve. Refusing it arc-side would be a false refusal
+ *     against a legitimately published version and would break the exactness
+ *     property this mirror exists for. If the registry tightens, this follows —
+ *     that is the direction the dependency runs.
+ *
+ * Build metadata is excluded by construction rather than by a separate rule
+ * (the registry made the same derivation): a `+build` suffix simply has nowhere
+ * to match. No leading `v` — a stored registry version does not carry one.
+ *
+ * ## Shared with the publish side (arc#402)
+ *
+ * arc#402 enforces the same rule at `arc publish` and rebases onto this module
+ * as the single shape authority, so this constant is EXPORTED rather than
+ * copied. A second literal is exactly the drift arc#399 spent a slice deleting
+ * from the type enum; the pin grammar is not going to reintroduce it.
  */
-const EXACT_VERSION_RE = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
+export const EXACT_PIN_RE = /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?$/;
 
 /** Is `value` an exact pin (D4)? Ranges, X-ranges and `latest` are not. */
 export function isExactVersion(value: unknown): boolean {
-  return typeof value === "string" && EXACT_VERSION_RE.test(value.trim());
+  return typeof value === "string" && EXACT_PIN_RE.test(value.trim());
 }
 
 /** `@scope/name` — the registry addressing form arc already uses. */
@@ -99,8 +124,21 @@ const BARE_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/i;
  * A bare binary name. No path separator, no whitespace, no leading dash — the
  * value reaches a binary lookup, so the same argv-safety posture as
  * `isSafePinRef` applies.
+ *
+ * Case-INSENSITIVE, unlike arc#402's publish-side copy: this names a host
+ * binary, not a registry package, and mixed-case binaries exist on real PATHs.
+ * Flagged for the rebase — publish may legitimately be stricter about what it
+ * will let an author ship, but install must not refuse a binary the host has.
  */
 const TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * `produces:` is a lowercase capability slug — `software`, `research`. Same
+ * grammar and ceiling as arc#402's publish-side check, so a factory that
+ * validates here publishes there.
+ */
+const PRODUCES_RE = /^[a-z0-9][a-z0-9-]*$/;
+const MAX_PRODUCES_LENGTH = 64;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -133,8 +171,35 @@ export function validateCompositionFields(manifest: unknown): Violation[] {
   validateReferences(manifest.references, composition, add);
   validateTools(manifest.tools, type, add);
   validateProduces(manifest.produces, type, add);
+  validateNoOwnCapabilities(manifest.capabilities, composition, add);
 
   return violations;
+}
+
+/**
+ * A composition declares NO capability block of its own (arc#400 review, S2).
+ *
+ * arc#399 made the block OPTIONAL for `bundle`/`factory`; this makes declaring
+ * one an error. The doctrine is the same one that motivated the exemption, taken
+ * to its conclusion: a composition ships no code, so it has no surface to
+ * declare, and its real surface is the UNION of its members', computed at
+ * install and shown in one review (D2). A composition that ALSO declares a
+ * block creates two answers to "what can this do" — the declared one and the
+ * computed one — and the declared one is the one an operator reads in the repo
+ * while the computed one is the one that governs. That gap is worth more as a
+ * refusal than as a validated-in-full nicety, and it matches the registry's own
+ * gate (meta-factory PR #574 §8).
+ *
+ * This supersedes arc#399's "the exemption covers PRESENCE only; a composition
+ * that DOES declare a block has it validated in full" — see the note on
+ * `validateCapabilities` in validate-manifest.ts, which now defers here.
+ */
+function validateNoOwnCapabilities(capabilities: unknown, composition: boolean, add: Add): void {
+  if (!composition || capabilities === undefined || capabilities === null) return;
+  add(
+    "capabilities",
+    "must not be declared on a reference-composition — a composition ships no code of its own, so its surface is the UNION of its members', computed at install and shown in one combined review (docs/design-factory-type.md D2). Remove the block.",
+  );
 }
 
 type Add = (field: string, rule: string) => void;
@@ -251,8 +316,17 @@ function validateProduces(produces: unknown, type: string | undefined, add: Add)
     return;
   }
   const values = Array.isArray(produces) ? produces : [produces];
-  if (values.length === 0 || !values.every((v) => isNonEmptyString(v))) {
-    add("produces", "must be a non-empty string, or an array of non-empty strings");
+  if (values.length === 0) {
+    add("produces", "must name at least one capability slug");
+    return;
+  }
+  for (const value of values) {
+    if (!isNonEmptyString(value) || !PRODUCES_RE.test(value) || value.length > MAX_PRODUCES_LENGTH) {
+      add(
+        "produces",
+        `must be a lowercase capability slug (^[a-z0-9][a-z0-9-]*$, max ${MAX_PRODUCES_LENGTH} chars) — e.g. 'software'; got ${JSON.stringify(value)}`,
+      );
+    }
   }
 }
 
@@ -701,9 +775,25 @@ export type ReferenceResolver = (
   reference: PackageReference,
 ) => Promise<{ ok: true; member: ResolvedCompositionMember } | { ok: false; error: string }>;
 
-export type MemberInstaller = (
-  member: ResolvedCompositionMember,
-) => Promise<{ success: boolean; error?: string; version?: string }>;
+export type MemberInstaller = (member: ResolvedCompositionMember) => Promise<{
+  success: boolean;
+  error?: string;
+  /**
+   * The name the member was RECORDED under. Needed for the post-landing
+   * surface check (F2): a package's recorded name is its manifest's, which can
+   * differ from the reference's label. Absent ⇒ the check is skipped, because
+   * there is nothing to look the recorded surface up by.
+   */
+  name?: string;
+  version?: string;
+  /**
+   * The member was already installed and nothing was done. A pre-existing
+   * install was consented to separately, so a surface difference against it is
+   * reported but is NOT this composition's refusal to make — see
+   * `installCompositionMembers`.
+   */
+  alreadyInstalled?: boolean;
+}>;
 
 /** Present the combined review and return the operator's answer. */
 export type CompositionConfirm = (reviewLines: string[]) => Promise<boolean>;
@@ -730,7 +820,21 @@ export interface CompositionPlan {
 
 export type PrepareResult =
   | { ok: true; plan: CompositionPlan }
-  | { ok: false; error: string };
+  | {
+      ok: false;
+      error: string;
+      /**
+       * Members that had already been STAGED on disk when the refusal fired
+       * (arc#400 review, W3).
+       *
+       * Staging is not landing — a scratch clone or a verified tarball extracted
+       * to a scratch dir places no symlink, no DB row and no host drop — but it
+       * does place bytes, and bytes a refusal leaves behind become the next
+       * run's confusing state. composition.ts cannot delete them (it owns no
+       * filesystem, deliberately), so it HANDS THEM BACK and install.ts sweeps.
+       */
+      staged: ResolvedCompositionMember[];
+    };
 
 function memberSurface(member: ResolvedCompositionMember): CompositionMemberSurface {
   return {
@@ -760,18 +864,23 @@ export async function prepareComposition(opts: {
   const log = seams.log ?? ((line: string) => { console.log(line); });
   const warn = seams.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
 
+  // Members staged on disk so far. Handed back on every refusal path so the
+  // caller can sweep them (W3) — see PrepareResult.
+  const members: ResolvedCompositionMember[] = [];
+  const refuse = (error: string): PrepareResult => ({ ok: false, error, staged: [...members] });
+
   // 1. VALIDATE the composition manifest. Free, and it catches the authoring
-  //    mistakes — a range pin above all (D4).
+  //    mistakes — a range pin above all (D4), and a composition that tries to
+  //    declare a capability surface of its own (S2).
   const violations = validateCompositionFields(manifest);
   if (violations.length > 0) {
-    return {
-      ok: false,
-      error: [
+    return refuse(
+      [
         `Refusing to install '${manifest.name}': its composition declarations are invalid.`,
         ...violations.map((v) => `  ${v.field}: ${v.rule}`),
         "Nothing was installed.",
       ].join("\n"),
-    };
+    );
   }
 
   const references = readCompositionReferences(manifest);
@@ -785,7 +894,7 @@ export async function prepareComposition(opts: {
   );
   for (const line of toolCheck.warnings) warn(line);
   if (!toolCheck.ok) {
-    return { ok: false, error: toolCheck.error ?? "declared tools are not satisfied" };
+    return refuse(toolCheck.error ?? "declared tools are not satisfied");
   }
 
   // A composition with no references is slice 1's manifest-only install. Say
@@ -805,28 +914,56 @@ export async function prepareComposition(opts: {
 
   const resolve = seams.resolve;
   if (!resolve) {
-    return {
-      ok: false,
-      error: `Refusing to install '${manifest.name}': no reference resolver is configured (internal error).`,
-    };
+    return refuse(
+      `Refusing to install '${manifest.name}': no reference resolver is configured (internal error).`,
+    );
   }
 
   // 3. RESOLVE every reference and read every member manifest. All of them,
   //    before any of them installs — a failure on the LAST member must prevent
   //    the FIRST from landing.
   if (!opts.yes) log(`\nResolving ${references.length} reference(s) for '${manifest.name}'…`);
-  const members: ResolvedCompositionMember[] = [];
   for (const reference of references) {
     const resolved = await resolve(reference);
     if (!resolved.ok) {
-      return {
-        ok: false,
-        error: [
+      return refuse(
+        [
           `Refusing to install '${manifest.name}': member '${reference.name}@${reference.version}' could not be resolved.`,
           `  ${resolved.error}`,
           "Nothing was installed — a composition is one decision, so one bad member aborts all of it (docs/design-factory-type.md D2).",
         ].join("\n"),
-      };
+      );
+    }
+
+    // The member is staged from here on: record it BEFORE any further refusal
+    // so W3's sweep can reach it.
+    members.push(resolved.member);
+
+    // ── F1 (arc#400 review) — COMPOSITIONS DO NOT NEST ────────────────────
+    //
+    // A composition-typed member is a consent bypass, not a layering nicety.
+    // A `bundle`/`factory` manifest declares no capabilities of its own, so it
+    // contributes ZERO rows to the union: the combined review renders "Risk:
+    // LOW / (none)" — a truthful summary of the member's own manifest and a
+    // completely false summary of what installing it does. The member
+    // installer then runs with `yes: true` (correctly: this member WAS
+    // approved), and the nested composition's own members install with no
+    // review at all. Everything reachable through the nesting arrives unseen.
+    //
+    // The fix is refusal rather than recursion. Recursing would mean flattening
+    // an unbounded graph into one review, which brings cycle detection, a depth
+    // ceiling, and a review long enough that nobody reads it — while the
+    // registry has already ruled the other way (BUNDLE_RECURSIVE; meta-factory
+    // PR #574 §8) and the design's no-nesting extension says the same. arc
+    // refusing what the registry refuses keeps one answer in the ecosystem.
+    if (isCompositionType(resolved.member.manifest.type)) {
+      return refuse(
+        [
+          `Refusing to install '${manifest.name}': member '${reference.name}' is itself a '${resolved.member.manifest.type}' — compositions cannot nest.`,
+          "A composition declares no capability surface of its own, so a nested one would contribute NOTHING to the combined review while installing its own members unreviewed — the review would say 'no capabilities' about an install that has them.",
+          "Flatten the members into this composition's own references[]. Nothing was installed.",
+        ].join("\n"),
+      );
     }
 
     // D4, re-checked against the bytes actually resolved: a pin that does not
@@ -834,16 +971,14 @@ export async function prepareComposition(opts: {
     // came about (a moved tag, a registry that served the wrong version).
     const declared = resolved.member.manifest.version;
     if (declared !== reference.version) {
-      return {
-        ok: false,
-        error: [
+      return refuse(
+        [
           `Refusing to install '${manifest.name}': member '${reference.name}' is pinned to ${reference.version} but its manifest declares ${declared}.`,
           "A factory release is a reproducible snapshot (docs/design-factory-type.md D4). Nothing was installed.",
         ].join("\n"),
-      };
+      );
     }
 
-    members.push(resolved.member);
     if (!opts.yes) log(`  ✓ ${reference.name}@${reference.version}`);
   }
 
@@ -876,23 +1011,59 @@ export async function prepareComposition(opts: {
 
   const confirm = seams.confirm;
   if (!confirm) {
-    return {
-      ok: false,
-      error: `Refusing to install '${manifest.name}': no confirmation channel is available for the combined capability review.`,
-    };
+    return refuse(
+      `Refusing to install '${manifest.name}': no confirmation channel is available for the combined capability review.`,
+    );
   }
   const approved = await confirm(reviewLines);
   if (!approved) {
-    return {
-      ok: false,
-      error: [
+    return refuse(
+      [
         `Refusing to install '${manifest.name}': the combined capability review was not approved.`,
         "Nothing was installed. Re-run with --yes to approve non-interactively.",
       ].join("\n"),
-    };
+    );
   }
 
   return { ok: true, plan: { manifest, members, surfaces, surface, reviewed: true } };
+}
+
+/** A capability row, as `db.capabilityRows` / `db.recordedCapabilityRows` shape it. */
+export interface CapabilityRowLike {
+  type: string;
+  value: string;
+  reason?: string;
+}
+
+/** `type:value`, the identity two capability rows are the same grant under. */
+function rowKey(row: CapabilityRowLike): string {
+  return `${row.type}:${row.value}`;
+}
+
+/**
+ * How a landed capability surface differs from the one that was REVIEWED.
+ *
+ * Set difference on `type:value`, both directions, order-insensitive — a
+ * reordered surface is the same surface. Returns one human line per difference,
+ * empty when they agree.
+ *
+ * `reason` is deliberately not compared: it is documentation, not a grant, and
+ * a reworded reason is not a capability change worth refusing an install over.
+ */
+export function capabilitySurfaceDrift(
+  reviewed: readonly CapabilityRowLike[],
+  landed: readonly CapabilityRowLike[],
+): string[] {
+  const reviewedKeys = new Set(reviewed.map(rowKey));
+  const landedKeys = new Set(landed.map(rowKey));
+  const drift: string[] = [];
+  for (const row of landed) {
+    if (!reviewedKeys.has(rowKey(row))) drift.push(`  + ${row.type}: ${row.value} (never reviewed)`);
+  }
+  for (const row of reviewed) {
+    if (!landedKeys.has(rowKey(row))) drift.push(`  - ${row.type}: ${row.value} (reviewed, absent)`);
+  }
+  return drift;
 }
 
 /**
@@ -904,29 +1075,107 @@ export async function prepareComposition(opts: {
  * decision, and it propagates exactly like a failed `depends_on.packages`
  * dependency does today: loud, naming the member, with the members that
  * already landed left in place for `arc remove` to take down. Undoing a
- * partial composition is the lifecycle slice's job (arc#401, D6).
+ * partial composition is the lifecycle slice's job (arc#401, D6). The error
+ * NAMES those already-landed members, because "some of it installed" is
+ * useless to an operator who cannot see which parts (arc#400 review, S1).
+ *
+ * ## The post-landing surface check (arc#400 review, F2)
+ *
+ * Consent was given for a surface read from RESOLVED bytes. Landing is a
+ * separate act, and for a repo member it is a separate clone. Pinning to the
+ * resolved commit (see `resolveRepoReference`) closes the moved-tag window at
+ * the source; this is the belt to that pair of braces, and it generalises: it
+ * asks the only question that actually matters — *is what arc RECORDED for this
+ * member the surface the operator approved?* — without arc having to prove
+ * anything about how the bytes travelled. It covers the registry path for free.
+ *
+ * A drift on a member that FRESHLY landed is a refusal: the bytes on disk are
+ * not the bytes reviewed. A drift against a member that was ALREADY installed
+ * is reported as a warning instead — that install was consented to separately
+ * and this composition did not put it there, so refusing would make re-running
+ * `arc install <factory>` fail on state it did not create.
  */
 export async function installCompositionMembers(
   plan: CompositionPlan,
   installMember: MemberInstaller,
-  opts: { yes?: boolean; log?: (line: string) => void } = {},
-): Promise<{ success: boolean; error?: string }> {
+  opts: {
+    yes?: boolean;
+    log?: (line: string) => void;
+    warn?: (line: string) => void;
+    /**
+     * Read back the surface arc RECORDED for a landed package. install.ts binds
+     * this to `recordedCapabilityRows(db, name)`; composition.ts stays
+     * database-free. Absent ⇒ the F2 post-landing check is skipped.
+     */
+    recordedRowsFor?: (name: string) => CapabilityRowLike[];
+    /**
+     * The rows that were REVIEWED for a member, keyed by reference name. Bound
+     * to `capabilityRows(member.manifest)` — the same walk the review used.
+     */
+    reviewedRowsFor?: (member: ResolvedCompositionMember) => CapabilityRowLike[];
+    /** Called after each member lands, so the caller can mark it on the record (F3). */
+    onMemberLanded?: (member: ResolvedCompositionMember, landedName?: string) => void;
+  } = {},
+): Promise<{ success: boolean; error?: string; landed: string[] }> {
   const log = opts.log ?? ((line: string) => { console.log(line); });
+  const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const landed: string[] = [];
+
+  const withDebris = (message: string): string =>
+    landed.length === 0
+      ? `${message}\nNo member had landed yet — nothing to clean up.`
+      : `${message}\nAlready landed (left in place; \`arc remove <name>\` takes one down): ${landed.join(", ")}`;
 
   for (const member of plan.members) {
     const label = `${member.reference.name}@${member.reference.version}`;
     if (!opts.yes) log(`\nInstalling member: ${label}`);
+
     const result = await installMember(member);
     if (!result.success) {
       return {
         success: false,
-        error: `Failed to install composition member '${label}': ${result.error ?? "unknown error"}`,
+        landed,
+        error: withDebris(
+          `Failed to install composition member '${label}': ${result.error ?? "unknown error"}`,
+        ),
       };
     }
+
+    landed.push(member.reference.name);
+    opts.onMemberLanded?.(member, result.name);
+
+    // F2 — did what landed match what was approved?
+    if (opts.recordedRowsFor && opts.reviewedRowsFor && result.name) {
+      const drift = capabilitySurfaceDrift(
+        opts.reviewedRowsFor(member),
+        opts.recordedRowsFor(result.name),
+      );
+      if (drift.length > 0) {
+        if (result.alreadyInstalled) {
+          warn(
+            `arc: WARN — composition member '${label}' was already installed and its recorded capability surface differs from the reviewed one:\n${drift.join("\n")}\n` +
+              `Nothing was changed. That install was approved separately; run \`arc info ${result.name}\` to inspect it.`,
+          );
+        } else {
+          return {
+            success: false,
+            landed,
+            error: withDebris(
+              [
+                `Refusing to continue '${plan.manifest.name}': member '${label}' landed a DIFFERENT capability surface than the one reviewed.`,
+                ...drift,
+                "The bytes that installed are not the bytes that were approved — treat this as a supply-chain event, not a glitch.",
+              ].join("\n"),
+            ),
+          };
+        }
+      }
+    }
+
     if (!opts.yes) log(`  ✓ ${label}`);
   }
 
-  return { success: true };
+  return { success: true, landed };
 }
 
 /** The composition rows recorded at install — the lifecycle slice's input. */

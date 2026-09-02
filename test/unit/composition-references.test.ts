@@ -13,8 +13,16 @@ import {
   validateCompositionFields,
   type CompositionMemberSurface,
 } from "../../src/lib/composition.js";
-import { recordComposition, compositionMembers, allCompositions } from "../../src/lib/db.js";
-import { recordInstall } from "../../src/lib/db.js";
+import {
+  allCompositions,
+  beginComposition,
+  completeComposition,
+  compositionMembers,
+  compositionRecord,
+  markCompositionMemberLanded,
+  recordInstall,
+  removeSkill,
+} from "../../src/lib/db.js";
 import { createTestEnv, type TestEnv } from "../helpers/test-env.js";
 import type { ArcManifest } from "../../src/types.js";
 
@@ -72,11 +80,15 @@ function member(
 // ───────────────────────────────────────────────────────────────────────────
 
 describe("arc#400 D4 — references[] versions must be EXACT", () => {
-  test("isExactVersion accepts a fully-specified semver and nothing else", () => {
-    for (const ok of ["1.0.0", "0.1.0", "10.20.30", "1.2.3-rc.1", "1.2.3+build.5"]) {
+  test("isExactVersion accepts exactly what the REGISTRY can store, and nothing else", () => {
+    // The grammar is the registry's, mirrored byte-for-byte (arc#400 N2 —
+    // shared with the publish side, arc#402). See composition-hardening for the
+    // build-metadata / hyphenated-prerelease / leading-zero cases and why each
+    // falls the way it does.
+    for (const ok of ["1.0.0", "0.1.0", "10.20.30", "1.2.3-rc.1", "1.2.3-beta"]) {
       expect(isExactVersion(ok)).toBe(true);
     }
-    for (const bad of [">=1.0.0", "^1.2.0", "~1.2.0", "1.x", "1.2", "*", "latest", "", "  "]) {
+    for (const bad of [">=1.0.0", "^1.2.0", "~1.2.0", "1.x", "1.2", "*", "latest", "", "  ", "1.2.3+build.5"]) {
       expect(isExactVersion(bad)).toBe(false);
     }
   });
@@ -435,16 +447,16 @@ describe("arc#400 D5 — tier is the MIN of the members'", () => {
 // ───────────────────────────────────────────────────────────────────────────
 
 describe("arc#400 — the composition recorded in the DB (input to #401)", () => {
-  test("members + pinned versions round-trip, ordered as declared", async () => {
-    env = await createTestEnv();
+  /** Land a composition's own package row, as the install transaction would. */
+  function landFactoryRow(name: string): void {
     recordInstall(
       env.db,
       {
-        name: "software-factory",
+        name,
         version: "0.1.0",
-        repo_url: "https://example.com/factory",
-        install_path: "/tmp/factory",
-        skill_dir: "/tmp/factory",
+        repo_url: `https://example.com/${name}`,
+        install_path: `/tmp/${name}`,
+        skill_dir: `/tmp/${name}`,
         status: "active",
         artifact_type: "factory",
         tier: "custom",
@@ -454,75 +466,59 @@ describe("arc#400 — the composition recorded in the DB (input to #401)", () =>
         installed_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       },
-      { name: "software-factory", version: "0.1.0", type: "factory" },
+      { name, version: "0.1.0", type: "factory" },
     );
+  }
 
-    recordComposition(env.db, "software-factory", [
+  test("members + pinned versions round-trip, ordered as declared", async () => {
+    env = await createTestEnv();
+
+    // The record OPENS before any member lands (arc#400 review, F3) — which is
+    // why it is written here, before the factory's own row exists.
+    beginComposition(env.db, "software-factory", "0.1.0", [
       { name: "@metafactory/cortex", version: "6.1.0", source: "registry", ref: "@metafactory/cortex" },
       { name: "compass-core", version: "0.4.0", source: "repo", ref: "https://github.com/x/compass-core" },
     ]);
+    markCompositionMemberLanded(env.db, "software-factory", "@metafactory/cortex");
+    markCompositionMemberLanded(env.db, "software-factory", "compass-core");
+    landFactoryRow("software-factory");
+    completeComposition(env.db, "software-factory");
 
     const rows = compositionMembers(env.db, "software-factory");
     expect(rows.map((r) => r.member_name)).toEqual(["@metafactory/cortex", "compass-core"]);
     expect(rows.map((r) => r.member_version)).toEqual(["6.1.0", "0.4.0"]);
     expect(rows.map((r) => r.member_source)).toEqual(["registry", "repo"]);
+    expect(rows.map((r) => r.state)).toEqual(["landed", "landed"]);
     expect(rows[0].position).toBe(0);
     expect(rows[1].position).toBe(1);
 
-    const all = allCompositions(env.db);
-    expect(all.get("software-factory")!.length).toBe(2);
+    expect(compositionRecord(env.db, "software-factory")!.status).toBe("complete");
+    expect(allCompositions(env.db).get("software-factory")!.members.length).toBe(2);
   });
 
-  test("re-recording replaces rather than duplicates", async () => {
+  test("re-opening replaces rather than duplicates", async () => {
     env = await createTestEnv();
-    recordInstall(
-      env.db,
-      {
-        name: "f",
-        version: "0.1.0",
-        repo_url: "u",
-        install_path: "/tmp/f",
-        skill_dir: "/tmp/f",
-        status: "active",
-        artifact_type: "factory",
-        tier: "custom",
-        customization_path: null,
-        install_source: null,
-        library_name: null,
-        installed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      },
-      { name: "f", version: "0.1.0", type: "factory" },
-    );
     const one = [{ name: "a", version: "1.0.0", source: "repo" as const, ref: "r" }];
-    recordComposition(env.db, "f", one);
-    recordComposition(env.db, "f", one);
+    beginComposition(env.db, "f", "0.1.0", one);
+    beginComposition(env.db, "f", "0.1.0", one);
     expect(compositionMembers(env.db, "f").length).toBe(1);
+    // A re-open resets state: the previous attempt's "landed" is not carried
+    // forward, because this attempt has not landed it yet.
+    expect(compositionMembers(env.db, "f")[0].state).toBe("pending");
   });
 
-  test("removing the composition removes its member rows (FK cascade)", async () => {
+  test("removing the composition package removes its record and member rows", async () => {
     env = await createTestEnv();
-    recordInstall(
-      env.db,
-      {
-        name: "f",
-        version: "0.1.0",
-        repo_url: "u",
-        install_path: "/tmp/f",
-        skill_dir: "/tmp/f",
-        status: "active",
-        artifact_type: "factory",
-        tier: "custom",
-        customization_path: null,
-        install_source: null,
-        library_name: null,
-        installed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      },
-      { name: "f", version: "0.1.0", type: "factory" },
-    );
-    recordComposition(env.db, "f", [{ name: "a", version: "1.0.0", source: "repo", ref: "r" }]);
-    env.db.prepare("DELETE FROM skills WHERE name = ?").run("f");
+    beginComposition(env.db, "f", "0.1.0", [
+      { name: "a", version: "1.0.0", source: "repo", ref: "r" },
+    ]);
+    landFactoryRow("f");
+    completeComposition(env.db, "f");
+
+    removeSkill(env.db, "f");
+    // The header is deliberately not FK'd to `skills` (F3), so removeSkill
+    // deletes it explicitly; the membership cascades off the header.
+    expect(compositionRecord(env.db, "f")).toBeNull();
     expect(compositionMembers(env.db, "f")).toEqual([]);
   });
 });

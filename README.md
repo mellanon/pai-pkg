@@ -368,10 +368,11 @@ installer and the publish validator all derive from it, so `arc validate`,
 | `bundle` | **Composition:** a reference manifest — `references[]` name published packages | its members install at theirs |
 | `factory` | **Composition:** a `bundle` that also declares `tools:` and `produces:` | its members install at theirs |
 
-Compositions carry no artifact payload of their own, so they may omit the
-`capabilities:` block that every other type must declare: a composition's real
-capability surface is the union of its members', reviewed in one prompt at
-install time. See [`docs/design-factory-type.md`](docs/design-factory-type.md).
+Compositions carry no artifact payload of their own, so they do not declare the
+`capabilities:` block every other type must: a composition's real capability
+surface is the union of its members', reviewed in one prompt at install time.
+Declaring a block anyway is refused — two answers to "what can this do" is worse
+than one. See [`docs/design-factory-type.md`](docs/design-factory-type.md).
 
 #### Installing a composition: `references[]`, `tools:`, `produces:`
 
@@ -384,14 +385,23 @@ tier: custom
 
 # The MEMBERS. Every version is EXACT — a factory release is a reproducible
 # snapshot, so a range (">=6.0.0", "^1.2.0", "latest") is refused at install
-# and at publish. Address a member either by its scoped registry name, or by
-# a repo URL (checked out at the tag for that version).
+# and at publish. The grammar is the registry's own stored-version grammar, so
+# a pin arc accepts is one the registry can actually resolve. Address a member
+# either by its scoped registry name, or by a repo URL (resolved at the tag for
+# that version and then pinned to that COMMIT).
+#
+# A member may NOT itself be a bundle/factory: compositions do not nest. A
+# nested one would contribute nothing to the combined review while installing
+# its own members unreviewed.
 references:
   - name: "@metafactory/cortex"
     version: 6.1.0
   - name: compass-core
     version: 0.4.0
     repo: https://github.com/the-metafactory/compass-core
+
+# No `capabilities:` here. A composition ships no code, so it has no surface of
+# its own to declare; declaring one is a validation error.
 
 # HOST BINARIES the composition needs. Checked BEFORE any member is fetched;
 # a missing binary refuses the install by name. Unlike `depends_on.tools`
@@ -419,13 +429,25 @@ produces: software
    with unrestricted bash flagged and the combined risk computed over the union
    (two members that are each merely `medium` can compose to `high`);
 5. one confirmation (or `--yes`, which still prints the approved surface to
-   stderr for the record) — then all members install.
+   stderr for the record) — then all members install, and each one's **recorded**
+   surface is checked back against the approved one. A member that lands
+   something different is refused as a supply-chain event, not a glitch.
 
 The resolved membership and its pins are recorded and readable:
 
 ```bash
+# what a factory is made of, exactly
 arc list --json | jq '.packages[] | select(.composition) | .composition.members'
+
+# compositions that did NOT finish installing — these have no package row
+arc list --json | jq '.compositions[] | select(.status != "complete")'
 ```
+
+The composition record is opened *before* the first member lands and closed
+after the factory itself does, so an install interrupted in between — a kill, a
+member failing at runtime — shows up as an incomplete composition naming exactly
+which members landed, rather than as anonymous packages and no trace of the
+factory. `arc list` prints those under **Incomplete compositions**.
 
 Two things are deliberately *warnings*, not refusals: a factory declaring a
 higher `tier:` than the MIN of its members' (trust never averages up, so treat
