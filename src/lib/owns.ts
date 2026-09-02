@@ -151,6 +151,24 @@ export function validateOwns(owns: unknown): OwnsViolation[] {
 }
 
 /**
+ * Do two owns ENTRIES overlap on disk — equal, or one nested inside the other?
+ *
+ * The containment primitive `validateOwns` uses above, exported for arc#401's
+ * CROSS-MEMBER gate (`compositionOwnsConflicts`, lib/composition.ts). A
+ * composition can pair two individually-valid manifests into an invalid union —
+ * one member's userData containing another member's state — and the two gates
+ * must not hold two opinions about what "overlaps" means, so there is one
+ * implementation and the composition gate imports it rather than re-deriving.
+ *
+ * Compared on glob-stripped, tilde-expanded roots at PATH SEGMENT boundaries,
+ * so `~/work` and `~/workspace` do not overlap while `~/work` and `~/work/repo`
+ * do (in either argument order).
+ */
+export function ownsEntriesOverlap(a: string, b: string, home: string = homedir()): boolean {
+  return pathsNest(containmentRoot(a, home), containmentRoot(b, home));
+}
+
+/**
  * The absolute, non-glob path ROOT of an entry, for containment comparison.
  * Strips the glob tail (every segment from the first glob-magic segment on) and
  * tilde-expands to an absolute path under `home`. So `~/.config/cortex/**` and

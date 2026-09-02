@@ -344,3 +344,209 @@ here.
 publish-validation slice. The three arc↔registry divergences listed above are
 recorded, not fixed. And no registry-backed `MemberResolver` is wired: the seam
 exists and fails closed without one, which is the honest state until #366.
+
+---
+
+## Implementation record — arc#401 (lifecycle, D3 + D6)
+
+Additive. Records what slice 3 built, the two judgement calls it had to make,
+and the boundary it drew around `arc upgrade`. It changes no ratified decision
+above.
+
+**The snapshot schema, and the mistake it avoids.** `composition_inventory`
+(one row per `arc files` line, cascading off the composition header) stores
+each row as `{member, kind, owns_class, entry, present}`. The load-bearing
+choice is that an `owns:` row stores the **declaration**
+(`~/.config/metafactory/cortex`, globs included), re-expanded at diff time,
+while every other row stores a resolved absolute path.
+
+The obvious alternative — snapshot the list of paths that exist at install —
+would have made the D6 acceptance test *vacuous*. `owns` names what a
+package's RUNTIME writes, and at install almost none of it exists yet; that is
+the same fact `remove.ts` already encodes for cortex#2441 ("naming an absent
+declaration as kept on disk is misleading"). A snapshot of expansions records
+nothing for those entries, so the post-purge diff comes back empty because it
+looked at nothing. Storing the declaration puts every path the package created
+*between install and purge* in scope, which is the only version of D6 worth
+having. `present` records install-time liveness and the diff deliberately does
+not gate on it: a leak is a leak whenever it appeared.
+
+The snapshot is built from `filesListing` — the same walk `arc files
+<factory>` prints — so the record and the command cannot hold two opinions
+about what the composition put on the machine. `arc files <factory>` returns
+the union (factory + members, each line attributed with `member`) plus the
+per-member listings unmerged; a non-composition's output is byte-identical to
+arc#359's.
+
+**Refcount semantics — "exclusively owned", three referent classes.** A member
+is purged with the factory only when, after the factory's own record is gone,
+NOTHING holds it. Fail-safe throughout: an unanswerable question RETAINS.
+
+| Referent | Register | Why it counts |
+|---|---|---|
+| Another composition lists it | `composition_members` | arc#349's shared-dependency rule with a different register. Pending compositions count: an interrupted install may yet be resumed, and taking a member out from under it turns a recoverable half-install into a broken one. |
+| Another active package declares it in `depends_on.packages` | `packagesRequiring` (exported from `remove.ts`, not re-derived) | Literally arc#349's own denominator, including its "manifest unreadable ⇒ possible requirer" fail-safe. |
+| The operator installed it FIRST | `composition_members.state = 'preexisting'` | Undoing the composition's install decision must not undo one the operator made separately. |
+
+The third needed a schema addition, and the shape of it was the first
+judgement call. `InstallResult.alreadyInstalled` is knowable only at install
+and is worthless unless persisted, so it is persisted on the membership row.
+But it must NOT be recorded merely because the member was already installed:
+if another COMPOSITION is what installed it, that referent is already tracked
+by row 1, and marking it here too would make the member **immortal** —
+retained by the pre-existing rule long after the other composition went away,
+in defiance of D3's "falls with the last referent". So install records
+`preexisting` only when `compositionsReferencing(member, exclude: self)` is
+empty. The rejected alternative was inferring it from `skills.installed_at <
+compositions.started_at`: `beginComposition` re-stamps `started_at` on every
+re-install, so a factory installed twice would read every member as
+pre-existing and purge would quietly become a no-op forever.
+
+**The interrupted install — decided, not left open.** `arc purge <factory>` on
+a `pending` composition CLEANS THE DEBRIS: the landed members are cascaded
+(refcounted exactly as above — an interrupted install's members can be shared
+too) and the pending record is dropped. Without this the debris is
+unreachable: the factory has no `skills` row, so `arc purge` refused with "not
+installed" on the one name that could reach it, and the landed members look
+like ordinary standalone packages. This is D6 serving the case D6 exists for.
+Such a composition has no inventory snapshot (the snapshot is taken at
+`complete`), so the purge reports `untangle: NOT VERIFIED` rather than a green
+diff it did not earn.
+
+**`arc upgrade <factory>` — what this slice supports.** The factory advances
+to its new release and members to THAT release's pins, never floating latest.
+The sequencing IS the safety property: the prospective manifest is read off
+the remote (`git show @{u}:arc-manifest.yaml`), validated through the SAME
+`validateCompositionFields` install and publish use, planned, and every member
+pin pre-flighted (reachable? and does the manifest at it declare that version
+— D4 re-checked at upgrade) — all before the factory's own code moves. A
+factory recorded at v0.2.0 whose members never followed is a broken snapshot
+every later command believes, so a refusal must arrive while the factory is
+still on its old release.
+
+Members move through the ordinary `arc install --pin` path, so each inherits
+arc#396's dirty-tree, diverged-branch and capability-widening guards and its
+`replaceCapabilities` — the recorded surface describes the code now checked
+out. `yes: true` matches `createMemberInstaller`'s posture (`arc upgrade` is
+non-interactive by design; a widening is WARNed, not silent).
+
+Fail closed, by name, nothing moved:
+
+| Case | Reason |
+|---|---|
+| Registry member whose pin must move | Live-registry operations are HELD (arc#366). `fetchAndVerifyRegistryPackage` does accept an exact version, so the mechanism is not the obstacle — the obstacle is that there is no published factory to exercise a verified pinned re-download + atomic swap against, and shipping that untested on the supply-chain-verification route is worse than a named refusal. A registry member whose pin did NOT change needs no move and is not refused. |
+| Registry-sourced factory | Same, one level up. |
+| New release ADDS a member | A new member brings a surface nobody reviewed. That decision belongs to the one combined review (D2) — arc#400's F1 argument applied to upgrade. |
+| New release DROPS a member | Removal is the refcounted cascade above; upgrade does not make removal decisions. |
+| Pin unreachable, or the manifest at the pin disagrees | D4, re-checked against the bytes. |
+
+**Residual risk.** (a) The registry half of upgrade is unexercised by
+construction and lands with #366. (b) A member move that fails AFTER the
+factory has advanced leaves a genuine mixed state; it is reported per member
+and the composition record is rewritten to name the versions actually
+installed, so `arc list` shows the truth rather than a tidy fiction, but no
+rollback is attempted (the same contract as arc#346's cascade). (c) The
+untangle diff verifies the paths the snapshot NAMED — a package that writes
+outside everything it declares is outside D6's reach by construction, which is
+the same boundary `owns:` has had since arc#359.
+
+### Review hardening (arc#401 second pass)
+
+Two review lanes on the first implementation found three root causes and nine
+adversarial findings, five of them with executed repros. All are closed; the
+repros are committed as regressions
+(`test/commands/composition-hardening-401.test.ts`). What changed, and why the
+first answers were wrong:
+
+**ROOT 1 — one identity for a member.** Membership was keyed on the raw
+`references[].name` LABEL, while `skills.name` is the member's MANIFEST name.
+Every `@scope/name` member differs across those two by construction, so the
+snapshot, the purge cascade and the refcount all looked up a package that was
+not there: `arc purge <factory>` printed `untangle: CLEAN` over a fully
+installed member with its config still on disk, and a member shared under a
+case-variant label was deleted out from under the composition that needed it.
+
+The fix is a canonical key — scope-stripped, lowercased
+(`lib/composition-identity.ts`) — plus storing BOTH names:
+`composition_members.member_name` is now what landed, `member_label` what the
+reference said. Scope-stripping rather than scope-preserving is the deliberate
+half: `skills.name` is a primary key over bare manifest names, so arc cannot
+hold `@a/foo` and `@b/foo` as two packages, and a key finer-grained than the
+table it joins against is exactly how the label key failed. A GENUINE mismatch
+(not a scope difference) is now a refusal at landing, because the combined
+review attributed that member's surface to the label. `packagesRequiring`
+(#349's own denominator) compares canonically too — a missed requirer is a
+deletion, so widening the match only ever retains more.
+
+**ROOT 2 — `preexisting` means nobody tracked installed it.** The predicate
+was "does another composition MENTION this member", which is not "did another
+composition PUT IT THERE". Under it, a second factory referencing a package the
+operator had installed by hand recorded it `landed`, and purging the two
+factories in order deleted the operator's package. `compositionsInstalling`
+(state `landed` only) replaces `compositionsReferencing` at that call site.
+Two more windows in the same predicate: a RESUMED install re-marked its own
+members `preexisting` (immortal, and reported as residue forever) — closed by
+reading the prior self-states before `beginComposition` wipes them; and
+upgrade's two-step record rewrite exposed an all-`pending` intermediate whose
+kill erased the fact permanently — closed by `replaceCompositionRecord`, one
+transaction, which throws rather than write an ambiguous membership. The one
+remaining case (a row still `pending` because an INSTALL was killed mid-flight)
+has no recorded answer at all, so it falls back to `installed_at <
+started_at` — evidence too weak for the general predicate, strictly better than
+nothing here, and failing in the RETAIN direction.
+
+**ROOT 3 — honest reports, and the rest.** A retained member's paths are
+legitimately still on disk, and counting them as residue made CORRECT
+refcounting render as a failed untangle; they are a third bucket now
+(`InventoryDiff.retained`). The purge order is reversed — members first,
+factory (and the record) LAST — because taking the record down first left a
+window where a killed purge orphaned the members behind a name that then
+refused, which is the state the command exists to prevent. Cross-member `owns`
+overlap is refused before anything lands: two individually-valid manifests can
+compose into a union where one member's `state` sits inside another's
+`userData`, and purging then deleted user data while reporting it kept — the
+`/home` guarantee failing while claiming to hold. It is refused at composition
+time rather than repaired at purge time because at purge time there is no safe
+choice between the two members. `arc upgrade` now refuses on an unreadable
+remote (not knowing the plan is a reason to stop, never to do half of it), on a
+member whose repo URL changed between releases (a pinned member is a
+determinism claim about bytes, not a version number — checked even at an
+unchanged pin), and in pre-flight on a dirty member worktree. A mixed-state
+upgrade records `status: 'partial'` at the versions actually installed, so
+`arc list` flags it and a retry re-plans instead of reporting "already at".
+`arc install --pin` on a composition refuses and names `arc upgrade`; plain
+`arc remove <factory>` now says which members it orphaned.
+
+**Two follow-ups from verification.** Both are ROOT 1 consequences the first
+hardening pass did not chase far enough, and both were found by probing the
+NEW canonical key rather than the old code:
+
+*F10 — the duplicate check was still verbatim.* `references[]` could name
+`@a/dup` and `dup`, which the canonical key says are ONE member. Validation
+passed them, resolution passed them, the first landed, and the second collided
+on the `composition_members` primary key — an uncaught `SQLiteError` on the
+trust path, with a member installed and a `pending` record behind it. The check
+now keys on `canonicalMemberKey`. The message BRANCHES: a literal repeat keeps
+arc#402's "declared more than once" vocabulary (the publish side asserts it as
+the shared validator's contract), while two spellings of one member get their
+own line naming both — an author looking at two visibly different strings would
+read the generic message as a false positive and work around it.
+
+*F11 — the identity refusal left UNREACHABLE debris.* Two halves. The "already
+landed" pointer named reference LABELS, so `arc remove <label>` — the one
+command the error hands the operator — failed with "not installed" for exactly
+the members whose label differs from their manifest name. And the refusal
+returned BEFORE `onMemberLanded` ran, so the row kept the label and a later
+purge of the pending record stepped straight over an installed package: the
+same invisible-member failure ROOT 1 exists to close, reintroduced on the
+refusal path. The member is now RECORDED first — the caller's binding computes
+`landed`/`preexisting` exactly as it would otherwise, because the member is on
+disk either way — and the refusal comes second, with the pointer naming the
+landed name and a per-member command.
+
+**Residual risk after hardening.** The install-side `pending` window is
+narrowed, not eliminated — a kill between opening the record and marking a
+member leaves a row whose only evidence is a timestamp. `partial` compositions
+are re-planned but never rolled back. And the canonical key collapses two
+registry scopes that share a bare name, which is a distinction arc's `skills`
+table has never been able to represent either.

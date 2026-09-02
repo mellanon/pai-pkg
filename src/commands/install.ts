@@ -109,8 +109,18 @@ import {
 import {
   beginComposition,
   completeComposition,
+  compositionMembers,
+  compositionRecord,
+  compositionsInstalling,
   markCompositionMemberLanded,
+  type CompositionMemberState,
 } from "../lib/db.js";
+import { canonicalMemberKey, memberIdentityRefusal } from "../lib/composition-identity.js";
+// arc#401 D6 — the install-time inventory snapshot is built from the SAME walk
+// `arc files` prints, so the record and the command cannot drift. files.ts is a
+// leaf w.r.t. install.ts (it reads the DB and the manifest; it installs
+// nothing), so this import introduces no cycle.
+import { recordCompositionSnapshot } from "./files.js";
 import { loadSources } from "../lib/sources.js";
 import { fetchAndVerifyRegistryPackage, parsePackageRef } from "../lib/registry-install.js";
 
@@ -758,6 +768,22 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
   if (compositionPlan?.members.length) {
     const seams = defaultCompositionSeams(opts);
 
+    // arc#401 review, ROOT 2(b) — READ THE PRIOR SELF-STATES FIRST.
+    //
+    // `beginComposition` replaces the record, which wipes the `landed` /
+    // `preexisting` marks a previous attempt recorded. On a RESUME (re-running
+    // `arc install <factory>` after a member failed) every member is then
+    // already installed, so the fresh computation below would mark them all
+    // `preexisting` — immortal, and reported as residue by the untangle diff
+    // forever. This composition DID install them, on the first attempt, and
+    // that fact survives the rewrite only because it is read out first.
+    const priorStates = new Map(
+      compositionMembers(db, manifest.name).map((row) => [
+        canonicalMemberKey(row.member_label),
+        row.state,
+      ]),
+    );
+
     // F3: OPEN the composition record before the first member lands. From here
     // an interruption — a kill, a member failing at runtime — is visible as an
     // incomplete composition rather than as anonymous member packages and no
@@ -778,8 +804,45 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
       // no database, deliberately.
       recordedRowsFor: (name) => recordedCapabilityRows(db, name),
       reviewedRowsFor: (member) => capabilityRows(member.manifest),
-      onMemberLanded: (member) => {
-        markCompositionMemberLanded(db, manifest.name, member.reference.name);
+      // arc#401 review, ROOT 1 — a member that lands under a name the reference
+      // did not name is refused. The combined review attributed its surface to
+      // the LABEL, and the record every lifecycle command walks would key on a
+      // name nothing installed. A scope difference is the documented
+      // equivalence and passes; a different name does not.
+      identityRefusalFor: (member, landedName) =>
+        memberIdentityRefusal({
+          compositionName: manifest.name,
+          label: member.reference.name,
+          landedName,
+        }),
+      // arc#401 D6: record not just THAT the member is dealt with, but whether
+      // this composition PUT IT THERE — the one fact standing between a
+      // hand-installed package and the purge cascade.
+      //
+      // Three inputs, in priority order:
+      //  1. A PRIOR self-state (this is a resume). Who installed the member did
+      //     not change because the install was re-run — carry it forward.
+      //  2. `alreadyInstalled` + no other composition that actually INSTALLED
+      //     it ⇒ the operator put it there ⇒ `preexisting`.
+      //  3. Otherwise this composition installed it ⇒ `landed`.
+      //
+      // Step 2 asks `compositionsInstalling`, not `compositionsReferencing`:
+      // mere membership elsewhere is not "somebody else installed it", and the
+      // substitution let a second factory claim `landed` over the operator's
+      // own package (reproduced, standard C1).
+      onMemberLanded: (member, landedName, alreadyInstalled) => {
+        const label = member.reference.name;
+        const recordedName = landedName ?? label;
+        const prior = priorStates.get(canonicalMemberKey(label));
+        const installedElsewhere =
+          compositionsInstalling(db, recordedName, { exclude: manifest.name }).length > 0;
+        const state: CompositionMemberState =
+          prior === "landed" || prior === "preexisting"
+            ? prior
+            : alreadyInstalled && !installedElsewhere
+              ? "preexisting"
+              : "landed";
+        markCompositionMemberLanded(db, manifest.name, label, state, recordedName);
       },
     });
     if (!membersResult.success) {
@@ -1002,6 +1065,19 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
   // that distinguishes a finished composition from an interrupted one.
   if (compositionPlan?.members.length) {
     completeComposition(db, manifest.name);
+    // arc#401 D6 — and TAKE THE INVENTORY SNAPSHOT. The composition is now
+    // fully landed, so `arc files` can see the whole footprint: the factory's
+    // own manifest install plus every member's. That union is what `arc purge`
+    // must account for, and the snapshot is what the post-purge diff is
+    // measured against. Best-effort: a snapshot that cannot be taken must not
+    // fail an install that has already succeeded, but it IS said out loud,
+    // because a composition with no snapshot has no untangle proof.
+    await recordCompositionSnapshot(db, arc, host, manifest.name).catch((err: unknown) => {
+      process.stderr.write(
+        `  ⚠ could not record the install-time inventory for '${manifest.name}': ${errorMessage(err)}; ` +
+          `\`arc purge ${manifest.name}\` will still cascade, but cannot verify the untangle (arc#401 D6)\n`,
+      );
+    });
   }
 
   // F-6b (arc#228) — IDENTITY STEP. For type:agent packages, provision the
@@ -2840,6 +2916,28 @@ async function repinOrNoop(
   // No pin → arc#354 behaviour, untouched. preExtractedPath is a registry
   // install with no git checkout to move.
   if (!opts.pinnedRef || opts.preExtractedPath) return noop;
+
+  // arc#401 review, W3 — a COMPOSITION is not re-pinnable through this path.
+  //
+  // `repinInstalledCheckout` moves ONE package's checkout. For a factory that
+  // moves the factory's own manifest and nothing else: its members stay on the
+  // previous release's pins while the recorded version says otherwise, which is
+  // precisely the broken snapshot `arc upgrade <factory>` spends a pre-flight
+  // avoiding (docs/design-factory-type.md D4). Refusing and naming the command
+  // that does the whole job is better than silently doing a third of it — and
+  // better than quietly dispatching, because `--pin` names a REF while a
+  // composition release is chosen by version, and the two are not the same
+  // request.
+  const composition = compositionRecord(opts.db, existing.name);
+  if (composition) {
+    return {
+      success: false,
+      name: existing.name,
+      error:
+        `Refusing to re-pin '${existing.name}': it is a recorded composition (v${composition.version}, ${composition.status}), and \`--pin\` would move the factory's own checkout while leaving its members on the previous release's pins.\n` +
+        `A composition advances as a whole — factory to its new release, members to THAT release's pins (docs/design-factory-type.md D3/D4). Run \`arc upgrade ${existing.name}\` instead. Nothing was moved.`,
+    };
+  }
 
   // Confused-deputy guard (arc#396 review, F4). The repo-NAME duplicate guard
   // matches on a basename (`repo_url.endsWith(repoName)`), and two different

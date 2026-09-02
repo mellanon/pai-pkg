@@ -2,12 +2,30 @@ import { existsSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { cp, mkdir } from "fs/promises";
 import { homedir } from "os";
-import type { ArcPaths, HostAdapter, RulesTemplate } from "../types.js";
+import type { ArcManifest, ArcPaths, HostAdapter, RulesTemplate } from "../types.js";
 import type { Database } from "bun:sqlite";
-import { listSkills, getSkill, listByLibrary, replaceCapabilities } from "../lib/db.js";
+import {
+  compositionMembers,
+  compositionRecord,
+  getSkill,
+  listByLibrary,
+  listSkills,
+  replaceCapabilities,
+  replaceCompositionRecord,
+  type CompositionMemberState,
+} from "../lib/db.js";
 import { readManifest, readLibraryArtifacts } from "../lib/manifest.js";
 import YAML from "yaml";
-import { installSingleArtifact, installPackageDependencies } from "./install.js";
+import { install, installSingleArtifact, installPackageDependencies, type InstallResult } from "./install.js";
+import { recordCompositionSnapshot } from "./files.js";
+import { errorMessage } from "../lib/errors.js";
+import {
+  dirtyMemberEntries,
+  planMemberMoves,
+  resolveMemberPin,
+  type MemberMove,
+} from "../lib/composition-upgrade.js";
+import { readCompositionReferences, validateCompositionFields } from "../lib/composition.js";
 import { createSymlink } from "../lib/symlinks.js";
 import { resolveProvidesTarget } from "../lib/provides-target.js";
 import { findGitRoot } from "../lib/paths.js";
@@ -25,6 +43,36 @@ import { wireExtensions } from "../lib/extensions.js";
 import { requireBrokerForManifest } from "../lib/nats-broker.js";
 import { runSomaSkillProjection } from "../lib/soma-projection.js";
 import { installNodeDependencies, reportNodeDependencyResult, dropUntrackedBunLock } from "../lib/artifact-installer.js";
+
+export interface UpgradeOptions {
+  /** Re-run the upgrade pipeline even when already at the latest version. */
+  force?: boolean;
+  /**
+   * Internal: packages already upgraded by this command (arc#346). Threads
+   * through the `depends_on.packages` cascade so a shared dep or a cycle is
+   * upgraded at most once. Not a public flag.
+   */
+  _seen?: Set<string>;
+  /**
+   * Internal (arc#401): upgrade ONLY this package, never its composition. Set
+   * by `upgradeComposition` when it moves the factory's own code, so the
+   * dispatch cannot re-enter. Not a public flag.
+   */
+  _skipComposition?: boolean;
+  /**
+   * TEST SEAM (arc#401 review, F8/S1): perform one member's move.
+   *
+   * Production leaves this absent and the move goes through the ordinary
+   * `arc install --pin` path. It exists because the MIXED-STATE path — the
+   * factory advanced, a member did not — is by design almost unreachable:
+   * pre-flight is meant to catch every failure that is knowable beforehand, so
+   * staging a real one means defeating the guards this slice added. The seam
+   * makes "what does arc RECORD when a member move fails anyway" an assertable
+   * claim instead of a comment, which is the same argument `composition.ts`
+   * makes for its own seams.
+   */
+  _moveMember?: (move: MemberMove) => Promise<InstallResult>;
+}
 
 export interface UpgradeCheckResult {
   name: string;
@@ -50,6 +98,16 @@ export interface UpgradeResult {
    * own rollback; a stale-but-working adapter is not a broken parent).
    */
   cascaded?: UpgradeResult[];
+  /**
+   * arc#401 D3 — for a COMPOSITION, the per-member moves onto the new
+   * release's pins. Distinct from `cascaded`, which is the `depends_on.packages`
+   * cascade (arc#346): a composition member is not a dependency, it IS the
+   * composition, and conflating the two would hide which of the two mechanisms
+   * moved a package.
+   *
+   * Empty (and omitted) when the factory was already current or no pin changed.
+   */
+  members?: { success: boolean; name: string; oldVersion: string; newVersion?: string; error?: string }[];
 }
 
 /**
@@ -85,6 +143,27 @@ function compareSemver(a: string, b: string): number {
  * to the local manifest, preserving prior behaviour.
  */
 function readRemoteManifestVersion(installPath: string): string | null {
+  const manifest = readRemoteManifest(installPath);
+  return manifest && typeof manifest.version === "string" ? manifest.version : null;
+}
+
+/**
+ * The manifest a git-cloned package's REMOTE default branch advertises —
+ * i.e. the release `arc upgrade` is about to pull, read WITHOUT pulling it.
+ *
+ * Extracted from `readRemoteManifestVersion` for arc#401: a composition's
+ * upgrade has to settle its whole plan (which members move, to which pins,
+ * and whether those pins are even reachable) BEFORE the factory's code moves,
+ * because a factory recorded at a release whose members never followed is a
+ * broken snapshot every later command believes. Reading the prospective
+ * manifest off `@{u}` is how that plan is built with nothing mutated.
+ *
+ * Returns null on ANY failure (not a git repo, no upstream, fetch/auth
+ * failure, missing or unparseable remote manifest) — callers fall back to the
+ * local manifest, preserving the pre-arc#305 behaviour and staying usable
+ * offline.
+ */
+function readRemoteManifest(installPath: string): Record<string, unknown> | null {
   const gitRoot = findGitRoot(installPath);
   if (!gitRoot || !existsSync(join(gitRoot, ".git"))) return null;
   const opts = { cwd: gitRoot, stdout: "pipe" as const, stderr: "pipe" as const };
@@ -102,16 +181,20 @@ function readRemoteManifestVersion(installPath: string): string | null {
       .trim();
   }
   if (!upstream) return null;
-  const show = Bun.spawnSync(["git", "show", `${upstream}:arc-manifest.yaml`], opts);
-  if (show.exitCode !== 0) return null;
-  try {
-    const parsed = YAML.parse(show.stdout.toString()) as { version?: unknown } | null;
-    return parsed && typeof parsed.version === "string" ? parsed.version : null;
-  } catch (_err) {
-    // Unparseable remote manifest → treat as "no remote version"; caller falls
-    // back to the local manifest. Non-fatal.
-    return null;
+  for (const file of ["arc-manifest.yaml", "pai-manifest.yaml"]) {
+    const show = Bun.spawnSync(["git", "show", `${upstream}:${file}`], opts);
+    if (show.exitCode !== 0) continue;
+    try {
+      const parsed = YAML.parse(show.stdout.toString()) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch (_err) {
+      // Unparseable remote manifest → treat as "no remote manifest"; the caller
+      // falls back to the local one. Non-fatal.
+    }
   }
+  return null;
 }
 
 /**
@@ -307,7 +390,7 @@ export async function upgradePackage(
   db: Database,
   arc: ArcPaths, host: HostAdapter,
   name: string,
-  opts?: { force?: boolean; _seen?: Set<string> }
+  opts?: UpgradeOptions
 ): Promise<UpgradeResult> {
   const seen = opts?._seen ?? new Set<string>();
   // Mark self BEFORE the cascade so a dependency that (transitively) depends
@@ -324,6 +407,15 @@ export async function upgradePackage(
   const installPath = skill.install_path;
   if (!existsSync(installPath)) {
     return { success: false, name, oldVersion: skill.version, error: `Install path not found: ${installPath}` };
+  }
+
+  // arc#401 D3 — a COMPOSITION advances as a whole: the factory to its new
+  // release, its members to THAT release's pins. Dispatched after the
+  // installed/active/on-disk checks (so a composition gets the same three
+  // errors any package does) and before any code moves, because the whole
+  // point of the composition path is that its refusals fire first.
+  if (!opts?._skipComposition && compositionRecord(db, name)) {
+    return upgradeComposition(db, arc, host, name, skill.repo_url, opts);
   }
 
   // Two upgrade substrates with different fetch + rollback mechanics (arc#187).
@@ -651,6 +743,256 @@ export async function upgradePackage(
     oldVersion,
     newVersion,
     ...(cascaded.length ? { cascaded } : {}),
+  };
+}
+
+/**
+ * Upgrade a whole COMPOSITION (arc#401, `docs/design-factory-type.md` D3/D4).
+ *
+ * The factory moves to its new release; every member moves to THAT release's
+ * pins — never floating latest. `lib/composition-upgrade.ts` owns the rules
+ * (and the header there explains what this slice supports and what waits for
+ * arc#366); this function owns the sequencing, and the sequencing is the safety
+ * property:
+ *
+ *   1. Read the PROSPECTIVE manifest off the remote, nothing moved.
+ *   2. Validate its composition declarations (exact pins, D4) — the same
+ *      function `arc validate` and `arc install` run, so the three gates cannot
+ *      disagree about one manifest.
+ *   3. Plan the member moves; refuse a membership change or a registry member.
+ *   4. PRE-FLIGHT every move: is the pin reachable, and does the manifest at it
+ *      declare that version? A refusal here is a refusal with the factory still
+ *      on its old release — which is the whole reason this step exists rather
+ *      than being discovered halfway through step 6.
+ *   5. Move the factory itself, through the ORDINARY single-package upgrade
+ *      (`_skipComposition`), so its hooks, templates, node deps, rollback and
+ *      `depends_on.packages` cascade are the same ones every package gets.
+ *   6. Move each member through the ORDINARY `arc install --pin` path, so each
+ *      inherits arc#396's dirty-tree / diverged-branch / capability-widening
+ *      guards and `replaceCapabilities` — the recorded surface describes the
+ *      code now checked out. `yes: true` matches `createMemberInstaller`'s
+ *      posture: `arc upgrade` is non-interactive by design, and re-prompting
+ *      per member is the death-by-a-thousand-confirmations D2 rejects.
+ *   7. Re-record the composition at its new version and RE-TAKE the inventory
+ *      snapshot, because D6's untangle proof must describe the release that is
+ *      actually installed.
+ *
+ * Steps 5 and 6 are best-effort in opposite directions on purpose. If 5 fails,
+ * nothing has moved and the refusal is clean. If a member in 6 fails, the
+ * factory has already advanced; the failure is REPORTED per member (mirroring
+ * arc#346's cascade contract) and the composition record is rewritten to the
+ * new release for the members that DID move, so `arc list` shows the true
+ * mixed state rather than a tidy fiction.
+ */
+async function upgradeComposition(
+  db: Database,
+  arc: ArcPaths,
+  host: HostAdapter,
+  name: string,
+  repoUrl: string,
+  opts?: UpgradeOptions,
+): Promise<UpgradeResult> {
+  const skill = getSkill(db, name);
+  // Unreachable: the caller resolved it. Narrowed rather than asserted.
+  if (!skill) return { success: false, name, oldVersion: "?", error: `"${name}" is not installed` };
+  const oldVersion = skill.version;
+
+  // A registry-sourced factory: the mechanism exists, the operations are HELD.
+  if (parsePackageRef(repoUrl)) {
+    return {
+      success: false,
+      name,
+      oldVersion,
+      error:
+        `Refusing to upgrade '${name}': it was installed from the REGISTRY (${repoUrl}), and moving a composition to a new registry release needs live-registry operations that are HELD (arc#366). ` +
+        `Nothing was moved. This slice upgrades repo-sourced compositions; re-run once arc#366 lands.`,
+    };
+  }
+
+  // 1. The PROSPECTIVE release. arc#401 review, F6: an unreadable remote is a
+  //    REFUSAL, not a fall-through.
+  //
+  //    The first cut fell through to the ordinary single-package path when the
+  //    remote could not be read (offline, no upstream, unparseable manifest).
+  //    For a plain package that is right — the local manifest is all there is,
+  //    and "already at X" is honest. For a COMPOSITION it is the exact lie this
+  //    command exists to prevent: without the new release's `references[]` there
+  //    is no way to know which members must move, so the fall-through could
+  //    advance the factory alone and leave every member on the old pins. Not
+  //    knowing the plan is a reason to stop, never a reason to proceed with
+  //    half of it.
+  const remote = readRemoteManifest(skill.install_path);
+  if (!remote) {
+    return {
+      success: false,
+      name,
+      oldVersion,
+      error:
+        `Refusing to upgrade '${name}': could not read the new release's manifest from its remote ` +
+        `(no upstream, the fetch failed, or the manifest is unreadable at ${skill.install_path}).\n` +
+        `A composition's members move to the pins the NEW release names (docs/design-factory-type.md D3/D4), and those pins are only in that manifest. ` +
+        `Advancing the factory without them would record a release whose members never followed. Nothing was moved.`,
+    };
+  }
+
+  // 2. Validated through the SAME gate install and publish use.
+  const violations = validateCompositionFields(remote);
+  if (violations.length > 0) {
+    return {
+      success: false,
+      name,
+      oldVersion,
+      error: [
+        `Refusing to upgrade '${name}': the new release's composition declarations are invalid.`,
+        ...violations.map((v) => `  ${v.field}: ${v.rule}`),
+        "Nothing was moved.",
+      ].join("\n"),
+    };
+  }
+
+  // 3. Plan.
+  const recorded = compositionMembers(db, name);
+  const plan = planMemberMoves(
+    recorded,
+    readCompositionReferences(remote as unknown as ArcManifest),
+  );
+  if (!plan.ok) {
+    return { success: false, name, oldVersion, error: plan.error };
+  }
+  const moves: MemberMove[] = plan.moves;
+
+  // 4. Pre-flight, with nothing moved yet. Everything that could make a member
+  //    move fail and is knowable NOW is asked here, because a refusal after the
+  //    factory has advanced is a mixed state rather than a clean "no".
+  const blockers: string[] = [];
+  for (const move of moves) {
+    const member = getSkill(db, move.name);
+    if (!member) {
+      blockers.push(`  ${move.name}: recorded as a member but not installed`);
+      continue;
+    }
+    if (member.status !== "active") {
+      blockers.push(`  ${move.name}: disabled — \`arc enable ${move.name}\` first`);
+      continue;
+    }
+    if (!existsSync(member.install_path)) {
+      blockers.push(`  ${move.name}: install path not found (${member.install_path})`);
+      continue;
+    }
+    // S1 — the dirty-tree question `repinInstalledCheckout` asks at MOVE time,
+    // asked here instead, so an operator's uncommitted edits produce a refusal
+    // with the factory still on its old release.
+    const dirty = dirtyMemberEntries(member.install_path);
+    if (dirty.length > 0) {
+      const shown = dirty.slice(0, 5).join("; ");
+      const more = dirty.length > 5 ? `; …and ${dirty.length - 5} more` : "";
+      blockers.push(
+        `  ${move.name}: uncommitted changes in ${member.install_path} (${shown}${more}) — commit, stash or discard them`,
+      );
+      continue;
+    }
+    const resolution = resolveMemberPin(member.install_path, move.to);
+    if (!resolution.ok) blockers.push(`  ${move.name}: ${resolution.error}`);
+  }
+  if (blockers.length > 0) {
+    return {
+      success: false,
+      name,
+      oldVersion,
+      error: [
+        `Refusing to upgrade '${name}': ${blockers.length} member(s) cannot reach the new release's pins.`,
+        ...blockers,
+        `Nothing was moved — a factory recorded at the new release with members still on the old pins is a broken snapshot (docs/design-factory-type.md D4).`,
+      ].join("\n"),
+    };
+  }
+
+  // 5. The factory itself, through the ordinary path.
+  const factoryResult = await upgradePackage(db, arc, host, name, {
+    ...opts,
+    _skipComposition: true,
+  });
+  if (!factoryResult.success) return factoryResult;
+
+  // 6. The members, each through the ordinary pinned-install path.
+  const moveMember =
+    opts?._moveMember ??
+    ((move: MemberMove) =>
+      install({ arc, host, db, repoUrl: move.ref, pinnedRef: move.to, yes: true }));
+
+  const memberResults: NonNullable<UpgradeResult["members"]> = [];
+  for (const move of moves) {
+    const result = await moveMember(move);
+    memberResults.push(
+      result.success
+        ? { success: true, name: move.name, oldVersion: move.from, newVersion: result.version ?? move.to }
+        : { success: false, name: move.name, oldVersion: move.from, error: result.error },
+    );
+  }
+
+  // 7. Re-record the composition — in ONE transaction (arc#401 review, F3).
+  //
+  // The first cut wrote this as `beginComposition` plus a loop of state marks.
+  // Between them every member reads `pending`, and a kill in that window erased
+  // which members the operator had installed by hand — after which the next
+  // `arc purge <factory>` deleted them and no re-run could heal it.
+  // `replaceCompositionRecord` commits the header, the membership and every
+  // state together or not at all.
+  const newVersion = factoryResult.newVersion ?? oldVersion;
+  const stateByLabel = new Map(recorded.map((row) => [row.member_label, row.state]));
+  const landedVersion = new Map(
+    memberResults.filter((m) => m.success).map((m) => [m.name, m.newVersion ?? m.oldVersion]),
+  );
+  const failed = memberResults.filter((m) => !m.success);
+
+  replaceCompositionRecord(
+    db,
+    name,
+    newVersion,
+    recorded.map((row) => ({
+      label: row.member_label,
+      name: row.member_name,
+      // A member whose move FAILED is recorded at the version it is actually
+      // on. The record describes the machine, not the intention — which is also
+      // what lets a later `arc upgrade` RE-PLAN the outstanding move.
+      version: landedVersion.get(row.member_name) ?? row.member_version,
+      source: row.member_source,
+      ref: row.member_ref,
+      // Who installed a member does not change because it moved version, so the
+      // `preexisting` marking (the one thing standing between a hand-installed
+      // package and the purge cascade) is carried across rather than reset.
+      state: (stateByLabel.get(row.member_label) as CompositionMemberState | undefined) ?? "landed",
+    })),
+    // F8 — an honest header. `partial` says what is true: the factory moved and
+    // at least one member did not. `arc list` flags it, and `upgradeComposition`
+    // re-plans from the membership (which records the OLD pins for the members
+    // that did not follow), so a retry finishes the job instead of reporting
+    // "already at" over a composition it never finished moving.
+    failed.length > 0 ? "partial" : "complete",
+  );
+
+  // S3 — a snapshot that cannot be re-taken is SAID, the same as install's.
+  // Silence would leave `arc purge` unable to verify the untangle with nothing
+  // explaining why.
+  await recordCompositionSnapshot(db, arc, host, name).catch((err: unknown) => {
+    process.stderr.write(
+      `  ⚠ could not re-record the install-time inventory for '${name}' after upgrade: ${errorMessage(err)}; ` +
+        `\`arc purge ${name}\` will still cascade, but cannot verify the untangle (arc#401 D6)\n`,
+    );
+  });
+
+  return {
+    ...factoryResult,
+    ...(memberResults.length ? { members: memberResults } : {}),
+    ...(failed.length
+      ? {
+          success: false,
+          error:
+            `'${name}' moved to ${newVersion}, but ${failed.length} member(s) did not follow:\n` +
+            failed.map((m) => `  ${m.name}: ${m.error ?? "unknown error"}`).join("\n") +
+            `\nThe composition is recorded as PARTIAL at the versions actually installed; re-run \`arc upgrade ${name}\` to retry the outstanding move(s).`,
+        }
+      : {}),
   };
 }
 

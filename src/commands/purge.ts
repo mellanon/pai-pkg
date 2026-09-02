@@ -39,9 +39,23 @@ import { existsSync } from "fs";
 import { mkdtemp, rm, writeFile, chmod, readFile, cp } from "fs/promises";
 import type { Database } from "bun:sqlite";
 import type { ArcManifest, ArcPaths, HostAdapter, OwnsDeclaration } from "../types.js";
-import { getSkill } from "../lib/db.js";
+import {
+  compositionInventory,
+  compositionMembers,
+  compositionRecord,
+  compositionsReferencing,
+  getSkill,
+  removeComposition,
+  type CompositionMemberRow,
+  type CompositionStatus,
+} from "../lib/db.js";
+import {
+  diffCompositionInventory,
+  formatInventoryDiff,
+  type InventoryDiff,
+} from "../lib/composition-inventory.js";
 import { readManifest } from "../lib/manifest.js";
-import { remove, type RemoveResult } from "./remove.js";
+import { packagesRequiring, remove, type RemoveResult } from "./remove.js";
 import { runScript } from "../lib/scripts.js";
 import {
   type SecretBackend,
@@ -98,6 +112,36 @@ export interface PurgeResult {
   /** Cascaded dependency names that THEMSELVES declare owns (dep-purge is out of
    *  v1 scope — surfaced so the operator can purge them explicitly). */
   cascadedOwns: string[];
+  /** arc#401 D6 — present only when the purged package is a COMPOSITION. */
+  composition?: CompositionPurgeReport;
+}
+
+/** A composition member left in place, and every referent that kept it. */
+export interface RetainedMember {
+  name: string;
+  /** Why it stayed — other compositions, other requirers, or a prior install. */
+  referents: string[];
+}
+
+/** What `arc purge <factory>` did to the composition as a whole (arc#401 D6). */
+export interface CompositionPurgeReport {
+  /** The record's status when the purge started — `pending` is the interrupted install. */
+  status: CompositionStatus;
+  /** Members taken down, in teardown order. */
+  purged: string[];
+  /** Members refcounting kept, each with the referents that kept it. */
+  retained: RetainedMember[];
+  /** Members whose own purge failed. Best-effort, per arc#348/#349 — never fatal. */
+  failed: { name: string; error: string }[];
+  /**
+   * The D6 verdict: the install-time inventory snapshot re-checked against the
+   * machine. `residue` empty and `refusals` naming only user data IS the
+   * acceptance criterion. On a dry run this is the CURRENT state (nothing has
+   * been removed yet), which is what makes the plan honest about what is there.
+   */
+  diff: InventoryDiff;
+  /** True when no snapshot was recorded (a pre-arc#401 install, or an interrupted one). */
+  snapshotMissing: boolean;
 }
 
 export interface PurgeOptions {
@@ -119,6 +163,12 @@ export interface PurgeOptions {
   systemctlRunner?: SystemctlRunner;
   /** Pass-through to remove() (multi-target host overrides). */
   hostOverrides?: HostOverrides;
+  /**
+   * Internal (arc#401): purge ONLY this package, never its composition cascade.
+   * Set by `purgeComposition` when it purges the factory's own package, so the
+   * dispatch below cannot re-enter. Not a public flag.
+   */
+  _skipComposition?: boolean;
 }
 
 /**
@@ -132,6 +182,14 @@ export async function purge(
   opts: PurgeOptions = {},
 ): Promise<PurgeResult> {
   const home = opts.home ?? homedir();
+
+  // arc#401 D3/D6 — a COMPOSITION purges as a whole: the factory, then every
+  // member it owns exclusively, refcounted per arc#349. Dispatched here rather
+  // than in the CLI so `arc remove --purge <factory>` and every direct caller
+  // get the cascade too; there is one purge, not two.
+  if (!opts._skipComposition && compositionRecord(db, name)) {
+    return purgeComposition(db, arc, host, name, opts);
+  }
 
   const skill = getSkill(db, name);
   if (!skill) {
@@ -253,6 +311,321 @@ export async function purge(
     purgeScript,
     cascadedOwns,
   };
+}
+
+/**
+ * Purge a whole COMPOSITION (arc#401, `docs/design-factory-type.md` D3/D6).
+ *
+ * D6 is the non-negotiable inherited from arc#365: install is a reversible
+ * decision. So this is the mirror image of the composition install — the
+ * factory's own package, every member it exclusively owns, every symlink, every
+ * declared config/state — with user data refused BY NAME exactly as a
+ * single-package purge refuses it (that rule lives in `planUserData` and is not
+ * re-implemented here). The proof is mechanical: the install-time inventory
+ * snapshot is re-checked against the machine afterwards and the diff must be
+ * empty except those refusals.
+ *
+ * ## Order, and why it is this order
+ *
+ *  1. READ the record and the snapshot INTO MEMORY. Removing the factory's
+ *     package deletes the composition header, and membership + inventory
+ *     cascade off it — so anything not read first is unrecoverable, including
+ *     the very snapshot the verification needs.
+ *  2. PURGE THE FACTORY'S OWN PACKAGE. This is what takes the record with it,
+ *     which is exactly what the refcount below needs: after it, "another
+ *     composition references this member" can no longer mean *this* one.
+ *     Mirrors arc#348's precondition ("call AFTER the parent's DB row is
+ *     deleted so the parent is naturally excluded from the denominator").
+ *  3. CASCADE to members in REVERSE declaration order — install lands them in
+ *     order, teardown reverses it, the same discipline `removePerTarget` keeps
+ *     for hosts. Each member is purged in full (`purge` recursing, so its own
+ *     owns/secrets/hooks all come along) or RETAINED with its referents named.
+ *  4. DIFF the in-memory snapshot against the machine.
+ *
+ * ## The interrupted install
+ *
+ * A `pending` composition has landed members and NO `skills` row for the
+ * factory — the install died between the two. `arc purge <factory>` is the way
+ * to clean that up: the landed members are cascaded (refcounted, exactly as
+ * above — an interrupted install's members can be shared too), and the pending
+ * record is dropped. Without this, the debris is unreachable: `arc purge` used
+ * to refuse ("not installed") on the one name that could name it, and the
+ * members look like ordinary standalone packages. This is D6 serving the case
+ * D6 exists for.
+ *
+ * ## Best-effort, per arc#348/#349
+ *
+ * A member whose purge fails is REPORTED (`failed`) and does not fail the
+ * composition: the factory is already down, and refusing to continue would
+ * leave the rest of the composition installed with no record tying it together.
+ * The diff then shows what is still there, which is the actionable form of the
+ * same news.
+ */
+async function purgeComposition(
+  db: Database,
+  arc: ArcPaths,
+  host: HostAdapter,
+  name: string,
+  opts: PurgeOptions,
+): Promise<PurgeResult> {
+  const home = opts.home ?? homedir();
+  const record = compositionRecord(db, name);
+  // Unreachable — the caller checked. Narrowed rather than asserted.
+  if (!record) {
+    return purge(db, arc, host, name, { ...opts, _skipComposition: true });
+  }
+
+  // 1. Everything the teardown will destroy, read first.
+  const members = compositionMembers(db, name);
+  const snapshot = compositionInventory(db, name);
+
+  // Teardown order: reverse of the order they landed in.
+  const teardownOrder = [...members].reverse();
+
+  const verdict = (retainedNames: readonly string[]): InventoryDiff =>
+    diffCompositionInventory(snapshot, {
+      home,
+      settingsPath: host.paths.settingsPath,
+      // W2 — a member refcounting KEPT is not a leak. Its paths are classified
+      // `retained`, so correct refcounting cannot render as a failed untangle.
+      retainedMembers: retainedNames,
+    });
+
+  if (opts.dryRun) {
+    const plan = await planMemberDispositions(db, name, teardownOrder, record.started_at);
+    const memberPlans: PurgeResult[] = [];
+    for (const member of plan.purgeable) {
+      memberPlans.push(await purge(db, arc, host, member, { ...opts, _skipComposition: true }));
+    }
+    const factoryPlan = getSkill(db, name)
+      ? await purge(db, arc, host, name, { ...opts, _skipComposition: true })
+      : null;
+    return {
+      success: true,
+      name,
+      dryRun: true,
+      // The union of what every purgeable member and the factory would delete /
+      // keep — a plan that named only the factory's own paths would understate
+      // a composition purge by everything that matters.
+      deletions: [...memberPlans.flatMap((p) => p.deletions), ...(factoryPlan?.deletions ?? [])],
+      keptUserData: [
+        ...memberPlans.flatMap((p) => p.keptUserData),
+        ...(factoryPlan?.keptUserData ?? []),
+      ],
+      secretsCleared: [
+        ...memberPlans.flatMap((p) => p.secretsCleared),
+        ...(factoryPlan?.secretsCleared ?? []),
+      ],
+      purgeScript: factoryPlan?.purgeScript ?? "none",
+      cascadedOwns: [],
+      composition: {
+        status: record.status,
+        purged: plan.purgeable,
+        retained: plan.retained,
+        failed: [],
+        diff: verdict(plan.retained.map((r) => r.name)),
+        snapshotMissing: snapshot.length === 0,
+      },
+    };
+  }
+
+  // 2. THE MEMBERS FIRST (arc#401 review, F5).
+  //
+  // The first cut took the factory down first, which deleted the composition
+  // record with it (`removeSkill` drops the header; membership and inventory
+  // cascade). A process killed between that and the member cascade left the
+  // members installed and UNREACHABLE: the only name that could resume the
+  // cascade now answered "not installed", so `arc purge <factory>` — the
+  // command whose entire purpose is untangling — had a window where it created
+  // exactly the orphan state it exists to prevent. Reproduced (R5).
+  //
+  // Members first means the record survives until the last thing that needs it
+  // is done, so a killed purge is RESUMABLE by the same name. `memberReferents`
+  // never depended on the record already being gone (it excludes this
+  // composition explicitly rather than relying on the row's absence), so the
+  // refcount is unaffected by the reordering.
+  const purged: string[] = [];
+  const failed: { name: string; error: string }[] = [];
+  const retained: RetainedMember[] = [];
+  const deletions: PurgeDeletion[] = [];
+  const keptUserData: PurgeKept[] = [];
+  const secretsCleared: string[] = [];
+
+  for (const member of teardownOrder) {
+    const referents = await memberReferents(db, name, member, record.started_at);
+    if (referents.length > 0) {
+      retained.push({ name: member.member_name, referents });
+      continue;
+    }
+    if (!getSkill(db, member.member_name)) continue; // never landed, or already gone
+
+    const result = await purge(db, arc, host, member.member_name, {
+      ...opts,
+      _skipComposition: true,
+    });
+    if (!result.success) {
+      failed.push({ name: member.member_name, error: result.error ?? "unknown error" });
+      continue;
+    }
+    purged.push(member.member_name);
+    deletions.push(...result.deletions);
+    keptUserData.push(...result.keptUserData);
+    secretsCleared.push(...result.secretsCleared);
+  }
+
+  // 3. THE FACTORY LAST — and with it the record. A `pending` composition has
+  //    no package of its own (the install died before its row committed), so
+  //    drop the record explicitly; membership and inventory cascade off it.
+  let factoryResult: PurgeResult | null = null;
+  if (getSkill(db, name)) {
+    factoryResult = await purge(db, arc, host, name, { ...opts, _skipComposition: true });
+    if (!factoryResult.success) {
+      // The members are down and the record is still here, so the operator can
+      // re-run the same name to finish. Reported, not fatal to what succeeded.
+      return {
+        ...factoryResult,
+        deletions,
+        keptUserData,
+        secretsCleared,
+        composition: {
+          status: record.status,
+          purged,
+          retained,
+          failed,
+          diff: verdict(retained.map((r) => r.name)),
+          snapshotMissing: snapshot.length === 0,
+        },
+      };
+    }
+    deletions.push(...factoryResult.deletions);
+    keptUserData.push(...factoryResult.keptUserData);
+    secretsCleared.push(...factoryResult.secretsCleared);
+  } else {
+    removeComposition(db, name);
+  }
+
+  // 4. The D6 verdict.
+  return {
+    success: true,
+    name,
+    ...(factoryResult?.removed ? { removed: factoryResult.removed } : {}),
+    deletions,
+    keptUserData,
+    secretsCleared,
+    purgeScript: factoryResult?.purgeScript ?? "none",
+    cascadedOwns: factoryResult?.cascadedOwns ?? [],
+    composition: {
+      status: record.status,
+      purged,
+      retained,
+      failed,
+      diff: verdict(retained.map((r) => r.name)),
+      snapshotMissing: snapshot.length === 0,
+    },
+  };
+}
+
+/**
+ * Is a member EXCLUSIVELY OWNED by the composition being purged — and if not,
+ * what keeps it? (arc#401 D3, mirroring arc#349's discipline.)
+ *
+ * Three referent classes, all computed from DB TRUTH, all fail-SAFE (an
+ * unanswerable question RETAINS the member — removal is destructive and hard to
+ * undo, so the bias runs one way):
+ *
+ *  1. ANOTHER COMPOSITION lists it. Including a `pending` one: an interrupted
+ *     install is a referent whose members may yet be resumed, and taking one
+ *     out from under it would turn a recoverable half-install into a broken
+ *     one. This is `arc#349`'s shared-dependency rule with `composition_members`
+ *     as the register instead of `depends_on.packages`.
+ *  2. ANOTHER ACTIVE PACKAGE declares it in `depends_on.packages` — literally
+ *     arc#349's own denominator, reused rather than re-derived
+ *     (`packagesRequiring`, which counts a package whose manifest cannot be
+ *     read as a possible requirer).
+ *  3. THE OPERATOR INSTALLED IT FIRST (`state: 'preexisting'`, recorded at
+ *     install — see `markCompositionMemberLanded`). Undoing the composition's
+ *     install decision must not undo a decision the operator made separately;
+ *     composition.ts already takes exactly this posture on the install side,
+ *     where a surface drift against an already-installed member is a warning
+ *     rather than a refusal, "because that install was consented to separately
+ *     and this composition did not put it there".
+ *
+ * Returns the referent descriptions (empty ⇒ exclusively owned ⇒ purge it).
+ */
+async function memberReferents(
+  db: Database,
+  compositionName: string,
+  member: CompositionMemberRow,
+  startedAt?: string,
+): Promise<string[]> {
+  const referents: string[] = [];
+
+  for (const other of compositionsReferencing(db, member.member_name, {
+    exclude: compositionName,
+  })) {
+    referents.push(`${other} (composition member)`);
+  }
+
+  for (const requirer of await packagesRequiring(db, member.member_name)) {
+    referents.push(`${requirer} (depends_on.packages)`);
+  }
+
+  if (member.state === "preexisting") {
+    referents.push(
+      `already installed before '${compositionName}' — the composition did not put it here`,
+    );
+  }
+
+  // A row still `pending` was never confirmed by this composition: the install
+  // was killed between opening the record and marking the member, so the one
+  // fact that decides this — did WE put it here — was never written.
+  //
+  // `preexisting` normally answers that, and arc#401's review closed the
+  // rewrite window that used to erase it (`replaceCompositionRecord`, F3). This
+  // is the remaining case, and it has no recorded answer at all, so fall back to
+  // the only evidence left: a package installed BEFORE this composition's record
+  // was opened cannot have been installed by it. Timestamps are too weak to
+  // carry the general predicate (`beginComposition` re-stamps `started_at` on
+  // every re-run, which is why the state column exists) — but they are strictly
+  // better than nothing, and they fail in the RETAIN direction, which is the
+  // one arc#349 says to fail in. The cost is that a resumed install's own
+  // members may be retained by a later purge of the pending record; the
+  // alternative is deleting a package the operator installed by hand.
+  if (member.state === "pending") {
+    const installed = getSkill(db, member.member_name);
+    if (installed && startedAt && installed.installed_at && installed.installed_at < startedAt) {
+      referents.push(
+        `installed before '${compositionName}' opened its record, which never confirmed the member (interrupted install) — refusing to assume the composition put it here`,
+      );
+    }
+  }
+
+  return referents;
+}
+
+/**
+ * Who goes, who stays, and why — the shared walk behind both the dry-run plan
+ * and the real cascade, so the preview an operator confirms can never disagree
+ * with what then happens.
+ *
+ * Safe to run BEFORE the factory's record is torn down (the dry-run case)
+ * because {@link memberReferents} excludes the composition being purged from
+ * its own denominator, rather than relying on the row already being gone.
+ */
+async function planMemberDispositions(
+  db: Database,
+  compositionName: string,
+  members: readonly CompositionMemberRow[],
+  startedAt?: string,
+): Promise<{ purgeable: string[]; retained: RetainedMember[] }> {
+  const purgeable: string[] = [];
+  const retained: RetainedMember[] = [];
+  for (const member of members) {
+    const referents = await memberReferents(db, compositionName, member, startedAt);
+    if (referents.length > 0) retained.push({ name: member.member_name, referents });
+    else if (getSkill(db, member.member_name)) purgeable.push(member.member_name);
+  }
+  return { purgeable, retained };
 }
 
 /** Config/state entries expanded, each carrying present/absent liveness. */
@@ -424,8 +797,33 @@ export function formatPurge(result: PurgeResult): string {
   if (!result.success && result.error) return `Error: ${result.error}`;
 
   const lines: string[] = [];
-  const head = result.dryRun ? `Purge plan for '${result.name}' (dry run — nothing deleted):` : `Purged '${result.name}':`;
+  const composition = result.composition;
+  const head = result.dryRun
+    ? `Purge plan for '${result.name}'${composition ? " and its composition" : ""} (dry run — nothing deleted):`
+    : `Purged '${result.name}':`;
   lines.push(head);
+
+  // arc#401 D3 — the cascade, before the path-level detail: an operator
+  // confirming a composition purge needs to know which PACKAGES go first.
+  if (composition) {
+    if (composition.status === "pending") {
+      lines.push(
+        `  composition: INTERRUPTED install (pending) — cleaning up the members that landed`,
+      );
+    }
+    const verb = result.dryRun ? "would purge" : "purged";
+    lines.push(
+      composition.purged.length > 0
+        ? `  members ${verb}: ${composition.purged.join(", ")}`
+        : `  members ${verb}: (none — every member is still referenced)`,
+    );
+    for (const kept of composition.retained) {
+      lines.push(`  kept (still referenced): ${kept.name} — ${kept.referents.join("; ")}`);
+    }
+    for (const failure of composition.failed) {
+      lines.push(`  ⚠ member '${failure.name}' failed to purge: ${failure.error}`);
+    }
+  }
 
   if (result.deletions.length === 0) {
     lines.push("  config/state: (nothing declared)");
@@ -443,9 +841,15 @@ export function formatPurge(result: PurgeResult): string {
     }
   }
 
+  // F9 — this is the DECLARED plan, read from `owns.userData` and printed
+  // whether or not the path exists. The untangle block below re-checks the same
+  // paths AFTER the purge and names only the ones actually found, so a declared
+  // path with nothing on disk appears here and not there. Two lines, two sides
+  // of the purge; the wording says which, so the asymmetry reads as the record
+  // it is rather than as a discrepancy.
   for (const k of result.keptUserData) {
     for (const p of k.paths) {
-      lines.push(`  kept (user data): ${p} — yours, arc will not touch it`);
+      lines.push(`  kept (declared user data): ${p} — yours, arc will not touch it`);
     }
   }
 
@@ -459,6 +863,21 @@ export function formatPurge(result: PurgeResult): string {
 
   for (const dep of result.cascadedOwns) {
     lines.push(`  note: cascaded dependency '${dep}' also declares owns — purge it explicitly with \`arc purge ${dep}\``);
+  }
+
+  // arc#401 D6 — the untangle verdict, last, because it is the conclusion the
+  // rest of the report supports. Suppressed on a dry run: there the diff
+  // describes what is on disk NOW, which would read as a list of failures for a
+  // purge that has not run yet.
+  if (composition && !result.dryRun) {
+    if (composition.snapshotMissing) {
+      lines.push(
+        `  untangle: NOT VERIFIED — no install-time inventory was recorded for '${result.name}' ` +
+          `(installed before arc#401, or the install was interrupted before the snapshot)`,
+      );
+    } else {
+      lines.push(...formatInventoryDiff(composition.diff));
+    }
   }
 
   return lines.join("\n");

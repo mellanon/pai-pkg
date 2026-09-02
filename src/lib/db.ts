@@ -7,6 +7,9 @@ import type {
   ArcManifest,
 } from "../types.js";
 import { normalizeDeclaredSecrets } from "./secrets.js";
+import type { InventoryEntry } from "./composition-inventory.js";
+import type { OwnsClass } from "./owns.js";
+import { canonicalMemberKey } from "./composition-identity.js";
 
 /**
  * Initialize (or open) the packages database.
@@ -116,10 +119,29 @@ export function openDatabase(dbPath: string): Database {
     );
   `);
 
+  // Membership. TWO names per row, and the distinction is load-bearing
+  // (arc#401 review, ROOT 1):
+  //
+  //   `member_label` — what `references[].name` said. `@metafactory/cortex`,
+  //     or a bare `cortex` beside a `repo:` URL. It is what the combined
+  //     capability review attributed lines to, so it is what an operator
+  //     recognises, and it is what a NEW release's references[] is matched
+  //     against on upgrade.
+  //   `member_name`  — what actually landed: the member's own `manifest.name`,
+  //     i.e. the `skills.name` primary key every other command joins on.
+  //
+  // The first cut of arc#401 stored only the label and joined `skills` with it.
+  // Every `@scope/name` member differs from its manifest name by construction,
+  // so the snapshot, the purge cascade and the refcount all looked up a package
+  // that was not there — `arc purge` reported a clean untangle over a fully
+  // installed member. Joins now key on `member_name`, compared through
+  // `canonicalMemberKey` (lib/composition-identity.ts) so scope and case cannot
+  // split one member into two.
   db.run(`
     CREATE TABLE IF NOT EXISTS composition_members (
       composition_name TEXT NOT NULL,
       member_name TEXT NOT NULL,
+      member_label TEXT NOT NULL DEFAULT '',
       member_version TEXT NOT NULL,
       member_source TEXT NOT NULL,
       member_ref TEXT NOT NULL,
@@ -130,11 +152,66 @@ export function openDatabase(dbPath: string): Database {
     );
   `);
 
+  // Migration: pre-review rows carry no label. Backfilling it from the name is
+  // exactly right for them — that IS what they stored.
+  try {
+    db.run(`ALTER TABLE composition_members ADD COLUMN member_label TEXT NOT NULL DEFAULT ''`);
+  } catch {
+    // Column already exists — expected for new or already-migrated databases.
+  }
+  db.run(`UPDATE composition_members SET member_label = member_name WHERE member_label = ''`);
+
+  // The install-time INVENTORY SNAPSHOT of the whole composition (arc#401,
+  // docs/design-factory-type.md D6 — #365's NON-NEGOTIABLE).
+  //
+  // `composition_members` says WHAT the composition is; this says what it PUT
+  // ON THE MACHINE. `arc purge <factory>` re-checks every row against disk
+  // afterwards, and the resulting diff — empty except user-data refusals — is
+  // the acceptance test for untangle symmetry.
+  //
+  // The shape is `arc files`' output, one row per line it would print: an
+  // `owns:` row stores the DECLARATION (re-expanded at diff time, because a
+  // package's runtime creates those paths AFTER install — see the header of
+  // lib/composition-inventory.ts, which owns the semantics), every other row a
+  // resolved absolute path. `present` is liveness at install.
+  //
+  // Cascades off the composition header, like membership: a composition that
+  // has been purged has no inventory, and `arc purge` computes its diff from
+  // the rows it read into memory BEFORE tearing the record down.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS composition_inventory (
+      composition_name TEXT NOT NULL,
+      member_name TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      -- '' rather than NULL for a non-owns row: SQLite permits NULLs in the
+      -- PRIMARY KEY of a rowid table, so a nullable column here would silently
+      -- stop de-duplicating the very rows the diff walks.
+      owns_class TEXT NOT NULL DEFAULT '',
+      entry TEXT NOT NULL,
+      present INTEGER NOT NULL,
+      PRIMARY KEY (composition_name, member_name, kind, owns_class, entry),
+      FOREIGN KEY (composition_name) REFERENCES compositions(name) ON DELETE CASCADE
+    );
+  `);
+
   return db;
 }
 
-/** Lifecycle of a composition install: in flight, or finished. */
-export type CompositionStatus = "pending" | "complete";
+/**
+ * Lifecycle of a composition record.
+ *
+ * `pending`  — members are landing, or the install was interrupted before the
+ *              composition's own row committed (arc#400 F3).
+ * `complete` — everything landed and agrees.
+ * `partial`  — arc#401 review, F8: an UPGRADE moved the factory but at least
+ *              one member did not follow. Distinct from `pending`, which is an
+ *              install that never finished: here the factory is installed and
+ *              usable, it simply is not the snapshot its version claims. The
+ *              status exists so `arc list` flags it and a later `arc upgrade`
+ *              RE-PLANS the outstanding moves instead of reporting "already
+ *              at" over a composition it never finished moving.
+ */
+export type CompositionStatus = "pending" | "complete" | "partial";
 
 /** The header row for a composition install (arc#400). */
 export interface CompositionRow {
@@ -152,7 +229,14 @@ export interface CompositionRow {
 /** One row of `composition_members` — a pinned member of a bundle/factory. */
 export interface CompositionMemberRow {
   composition_name: string;
+  /**
+   * The name the member LANDED under — its `manifest.name`, and therefore the
+   * `skills.name` every join uses. Equals `member_label` until the member
+   * lands and arc learns the real one (arc#401 review, ROOT 1).
+   */
   member_name: string;
+  /** What `references[].name` said. Display, and the upgrade-side match key. */
+  member_label: string;
   member_version: string;
   /** How the member was addressed: "registry" (`@scope/name`) or "repo" (URL). */
   member_source: string;
@@ -188,8 +272,8 @@ export function beginComposition(
   const now = new Date().toISOString();
   const insertMember = db.prepare(`
     INSERT INTO composition_members
-      (composition_name, member_name, member_version, member_source, member_ref, position, state)
-    VALUES (?, ?, ?, ?, ?, ?, 'pending')
+      (composition_name, member_name, member_label, member_version, member_source, member_ref, position, state)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
   `);
   const tx = db.transaction(() => {
     // Membership cascades off the header, but delete it explicitly so the order
@@ -200,8 +284,14 @@ export function beginComposition(
       "INSERT INTO compositions (name, version, status, started_at, updated_at) VALUES (?, ?, 'pending', ?, ?)",
     ).run(compositionName, version, now, now);
     members.forEach((member, position) => {
+      // `member_name` starts as the LABEL: nothing has landed yet, so the real
+      // manifest name is not known. `markCompositionMemberLanded` corrects it
+      // (arc#401 review, ROOT 1) — which is also why the rows an interrupted
+      // install leaves behind are keyed on labels and why the purge cascade
+      // tolerates a row whose name never got corrected.
       insertMember.run(
         compositionName,
+        member.name,
         member.name,
         member.version,
         member.source,
@@ -213,17 +303,284 @@ export function beginComposition(
   tx();
 }
 
-/** Mark one member as landed (arc#400 F3). No-op for an unknown member. */
+/** One member row as {@link replaceCompositionRecord} takes it. */
+export interface CompositionMemberInput {
+  /** `references[].name`. */
+  label: string;
+  /** The landed `manifest.name`. */
+  name: string;
+  version: string;
+  source: string;
+  ref: string;
+  state: CompositionMemberState;
+}
+
+/**
+ * Replace a composition's ENTIRE record — header, membership and member states
+ * — in ONE transaction (arc#401 review, F3).
+ *
+ * `arc upgrade <factory>` used to rewrite the record as `beginComposition`
+ * followed by a loop of `markCompositionMemberLanded` calls. Between the two
+ * every member reads `pending`, and a process killed in that window leaves a
+ * record that has FORGOTTEN which members the operator had installed by hand:
+ * the next `arc purge <factory>` then deletes them, and re-running the upgrade
+ * never heals it because the fact is gone. Reproduced (R3).
+ *
+ * The window cannot exist if there is no second step. Everything the record
+ * asserts — including `preexisting`, which is the only thing standing between
+ * a hand-installed package and a cascade — commits or none of it does.
+ *
+ * THROWS on a membership that would collapse two labels onto one landed name;
+ * the transaction rolls back, leaving the prior record untouched. That is a
+ * real authoring error (two references resolving to the same package), and
+ * silently keeping whichever row won the insert race would be the ROOT 1 bug
+ * again from the other end.
+ */
+export function replaceCompositionRecord(
+  db: Database,
+  compositionName: string,
+  version: string,
+  members: readonly CompositionMemberInput[],
+  status: CompositionStatus,
+): void {
+  const now = new Date().toISOString();
+  const insertMember = db.prepare(`
+    INSERT INTO composition_members
+      (composition_name, member_name, member_label, member_version, member_source, member_ref, position, state)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const tx = db.transaction(() => {
+    const seen = new Set<string>();
+    for (const member of members) {
+      const key = canonicalMemberKey(member.name);
+      if (seen.has(key)) {
+        throw new Error(
+          `composition '${compositionName}' would record two members under the name '${member.name}' ` +
+            `(labels collapse onto one package) — refusing to write an ambiguous membership`,
+        );
+      }
+      seen.add(key);
+    }
+    db.prepare("DELETE FROM composition_members WHERE composition_name = ?").run(compositionName);
+    db.prepare("DELETE FROM compositions WHERE name = ?").run(compositionName);
+    db.prepare(
+      "INSERT INTO compositions (name, version, status, started_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(compositionName, version, status, now, now);
+    members.forEach((member, position) => {
+      insertMember.run(
+        compositionName,
+        member.name,
+        member.label,
+        member.version,
+        member.source,
+        member.ref,
+        position,
+        member.state,
+      );
+    });
+  });
+  tx();
+}
+
+/**
+ * What a member row's `state` means once the member has been dealt with.
+ *
+ * `landed` — this composition installed it. `preexisting` — it was ALREADY
+ * installed, by something arc does not otherwise track, and this composition
+ * merely referenced it (arc#401).
+ */
+export type CompositionMemberState = "pending" | "landed" | "preexisting";
+
+/**
+ * Mark one member as dealt with (arc#400 F3; the `preexisting` state is
+ * arc#401's addition). No-op for an unknown member.
+ *
+ * ## Why `preexisting` is recorded, and recorded HERE
+ *
+ * `arc purge <factory>` cascades to the members the factory installed
+ * (refcounted per arc#349). "The members the factory installed" is not the
+ * same set as "the members the factory references": a package the operator had
+ * installed by hand before the factory existed was not put there by this
+ * decision, so undoing the decision must not take it away. That fact is only
+ * knowable at install (`InstallResult.alreadyInstalled`), and is worthless
+ * unless persisted — so it is persisted, on the row that already exists for it.
+ *
+ * The caller must NOT mark a member `preexisting` merely because it was already
+ * installed: another COMPOSITION may have installed it, and that referent is
+ * already tracked in `composition_members`. Marking it here too would make the
+ * member immortal — retained by the pre-existing rule long after the other
+ * composition went away, which is precisely the "falls with the last referent"
+ * guarantee D3 asks for. install.ts resolves that with
+ * {@link compositionsReferencing} before choosing the state.
+ */
 export function markCompositionMemberLanded(
   db: Database,
   compositionName: string,
-  memberName: string,
+  memberLabel: string,
+  state: CompositionMemberState = "landed",
+  landedName?: string,
 ): void {
   const now = new Date().toISOString();
+  // Key the UPDATE on the LABEL: the row was written from `references[]` before
+  // anything landed, so the label is the only value guaranteed to match it.
+  // `landedName` then corrects `member_name` to the manifest name, which is
+  // what every join uses from here on (arc#401 review, ROOT 1).
   db.prepare(
-    "UPDATE composition_members SET state = 'landed' WHERE composition_name = ? AND member_name = ?",
-  ).run(compositionName, memberName);
+    "UPDATE composition_members SET state = ?, member_name = ? WHERE composition_name = ? AND member_label = ?",
+  ).run(state, landedName ?? memberLabel, compositionName, memberLabel);
   db.prepare("UPDATE compositions SET updated_at = ? WHERE name = ?").run(now, compositionName);
+}
+
+/** A member row reduced to the facts a referent query needs. */
+interface MemberRefRow {
+  composition_name: string;
+  member_name: string;
+  state: string;
+}
+
+/** Every membership row naming `memberName`, compared canonically (ROOT 1). */
+function memberRowsFor(db: Database, memberName: string, exclude?: string): MemberRefRow[] {
+  const key = canonicalMemberKey(memberName);
+  const rows = db
+    .prepare(
+      "SELECT composition_name, member_name, state FROM composition_members ORDER BY composition_name",
+    )
+    .all() as MemberRefRow[];
+  return rows.filter(
+    (r) => canonicalMemberKey(r.member_name) === key && r.composition_name !== exclude,
+  );
+}
+
+/**
+ * The compositions that REFERENCE `memberName` — the retention denominator for
+ * arc#401's purge cascade.
+ *
+ * Compared through `canonicalMemberKey`, never by string equality: a member
+ * shared under `Shared-Core` and `shared-core`, or under `@scope/cortex` and
+ * `cortex`, is ONE member, and comparing verbatim is what let one factory's
+ * purge delete a package another factory still needed (reproduced, R2).
+ *
+ * `exclude` drops the caller's own composition. Pending compositions COUNT: an
+ * interrupted install is a referent whose members may yet be resumed or
+ * explicitly purged, and arc#349's posture on a refcount it cannot be sure
+ * about is to RETAIN. Ordered by name so a rendered reason string is stable.
+ */
+export function compositionsReferencing(
+  db: Database,
+  memberName: string,
+  opts: { exclude?: string } = {},
+): string[] {
+  return memberRowsFor(db, memberName, opts.exclude).map((r) => r.composition_name);
+}
+
+/**
+ * The compositions that actually INSTALLED `memberName` — those whose row for
+ * it records `state: 'landed'` (arc#401 review, ROOT 2).
+ *
+ * Strictly narrower than {@link compositionsReferencing}, and the difference IS
+ * the finding. install.ts asks this before recording a member `preexisting`,
+ * and "does another composition MENTION it" is not an answer to "did another
+ * composition PUT IT THERE": under the wider question, a second factory
+ * referencing a package the operator had installed by hand recorded it
+ * `landed`, and purging the two factories in order then deleted the operator's
+ * package (reproduced, standard C1).
+ *
+ * A composition that itself recorded the member `preexisting` did not install
+ * it either, so it correctly does not appear here.
+ */
+export function compositionsInstalling(
+  db: Database,
+  memberName: string,
+  opts: { exclude?: string } = {},
+): string[] {
+  return memberRowsFor(db, memberName, opts.exclude)
+    .filter((r) => r.state === "landed")
+    .map((r) => r.composition_name);
+}
+
+/**
+ * Delete a composition record outright — header, membership and inventory
+ * (arc#401).
+ *
+ * `removeSkill` already does this as part of removing the composition's own
+ * package. This is the path for the case that has no package to remove: an
+ * INTERRUPTED install, whose `skills` row never committed, leaves a `pending`
+ * header that nothing else can reach. Purging that debris is D6 serving the
+ * interrupted case.
+ */
+export function removeComposition(db: Database, compositionName: string): void {
+  db.prepare("DELETE FROM compositions WHERE name = ?").run(compositionName);
+}
+
+/**
+ * One row of the install-time inventory snapshot (arc#401 D6).
+ *
+ * The SHAPE is owned by `lib/composition-inventory.ts` (which knows what an
+ * owns class is and how to re-check one against disk); db.ts only persists it.
+ * A type-only import, so the two modules cannot form a runtime cycle.
+ */
+export type CompositionInventoryRow = InventoryEntry;
+
+/**
+ * Record the composition's install-time inventory (arc#401 D6).
+ *
+ * Replace-not-merge, exactly like `beginComposition`: the snapshot describes
+ * ONE release's footprint, so a re-install or an upgrade replaces it rather
+ * than accumulating the union of every release that was ever installed — a
+ * union whose diff would report long-deleted paths as leaks forever.
+ */
+export function recordCompositionInventory(
+  db: Database,
+  compositionName: string,
+  entries: readonly CompositionInventoryRow[],
+): void {
+  const insert = db.prepare(`
+    INSERT OR REPLACE INTO composition_inventory
+      (composition_name, member_name, kind, owns_class, entry, present)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM composition_inventory WHERE composition_name = ?").run(compositionName);
+    for (const row of entries) {
+      insert.run(
+        compositionName,
+        row.member,
+        row.kind,
+        row.ownsClass ?? "",
+        row.entry,
+        row.present ? 1 : 0,
+      );
+    }
+  });
+  tx();
+}
+
+/** The install-time inventory recorded for `compositionName` (arc#401 D6). */
+export function compositionInventory(
+  db: Database,
+  compositionName: string,
+): CompositionInventoryRow[] {
+  const rows = db
+    .prepare(
+      "SELECT member_name, kind, owns_class, entry, present FROM composition_inventory WHERE composition_name = ? ORDER BY member_name, kind, entry",
+    )
+    .all(compositionName) as {
+    member_name: string;
+    kind: string;
+    owns_class: string;
+    entry: string;
+    present: number;
+  }[];
+  return rows.map((r) => ({
+    member: r.member_name,
+    kind: r.kind,
+    // The column is a plain TEXT; the writer only ever puts an OwnsClass or ''
+    // in it, and the diff treats anything non-userData as purgeable, so a
+    // hand-edited value degrades to "must be gone" rather than to a crash.
+    ownsClass: r.owns_class === "" ? null : (r.owns_class as OwnsClass),
+    entry: r.entry,
+    present: r.present === 1,
+  }));
 }
 
 /**
