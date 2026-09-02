@@ -201,8 +201,13 @@ async function cascadeDependencyRemovals(
  * requirer and RETAINS the dep (counted under a `<name> (manifest unreadable)`
  * marker), rather than being assumed to need nothing. Better to leave a dep
  * installed than to orphan a package that actually depends on it.
+ *
+ * EXPORTED for arc#401's composition cascade, which asks the same question
+ * about a composition member that this asks about a dependency. Re-deriving it
+ * there would give arc two answers to "does anything still need this package",
+ * and the one that governs would depend on which command the operator ran.
  */
-async function packagesRequiring(
+export async function packagesRequiring(
   db: Database,
   depName: string,
 ): Promise<string[]> {

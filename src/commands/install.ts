@@ -109,8 +109,14 @@ import {
 import {
   beginComposition,
   completeComposition,
+  compositionsReferencing,
   markCompositionMemberLanded,
 } from "../lib/db.js";
+// arc#401 D6 — the install-time inventory snapshot is built from the SAME walk
+// `arc files` prints, so the record and the command cannot drift. files.ts is a
+// leaf w.r.t. install.ts (it reads the DB and the manifest; it installs
+// nothing), so this import introduces no cycle.
+import { recordCompositionSnapshot } from "./files.js";
 import { loadSources } from "../lib/sources.js";
 import { fetchAndVerifyRegistryPackage, parsePackageRef } from "../lib/registry-install.js";
 
@@ -778,8 +784,23 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
       // no database, deliberately.
       recordedRowsFor: (name) => recordedCapabilityRows(db, name),
       reviewedRowsFor: (member) => capabilityRows(member.manifest),
-      onMemberLanded: (member) => {
-        markCompositionMemberLanded(db, manifest.name, member.reference.name);
+      // arc#401 D6: record not just THAT the member is dealt with, but whether
+      // this composition put it there. A member that was ALREADY installed is
+      // `preexisting` — unless another COMPOSITION is what installed it, in
+      // which case that referent is already tracked in `composition_members`
+      // and marking it here too would make the member immortal: retained by
+      // the pre-existing rule long after the other composition is gone, in
+      // defiance of D3's "falls with the last referent".
+      onMemberLanded: (member, landedName, alreadyInstalled) => {
+        const recordedName = landedName ?? member.reference.name;
+        const trackedElsewhere =
+          compositionsReferencing(db, recordedName, { exclude: manifest.name }).length > 0;
+        markCompositionMemberLanded(
+          db,
+          manifest.name,
+          member.reference.name,
+          alreadyInstalled && !trackedElsewhere ? "preexisting" : "landed",
+        );
       },
     });
     if (!membersResult.success) {
@@ -1002,6 +1023,19 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
   // that distinguishes a finished composition from an interrupted one.
   if (compositionPlan?.members.length) {
     completeComposition(db, manifest.name);
+    // arc#401 D6 — and TAKE THE INVENTORY SNAPSHOT. The composition is now
+    // fully landed, so `arc files` can see the whole footprint: the factory's
+    // own manifest install plus every member's. That union is what `arc purge`
+    // must account for, and the snapshot is what the post-purge diff is
+    // measured against. Best-effort: a snapshot that cannot be taken must not
+    // fail an install that has already succeeded, but it IS said out loud,
+    // because a composition with no snapshot has no untangle proof.
+    await recordCompositionSnapshot(db, arc, host, manifest.name).catch((err: unknown) => {
+      process.stderr.write(
+        `  ⚠ could not record the install-time inventory for '${manifest.name}': ${errorMessage(err)}; ` +
+          `\`arc purge ${manifest.name}\` will still cascade, but cannot verify the untangle (arc#401 D6)\n`,
+      );
+    });
   }
 
   // F-6b (arc#228) — IDENTITY STEP. For type:agent packages, provision the

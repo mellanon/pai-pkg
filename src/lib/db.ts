@@ -7,6 +7,8 @@ import type {
   ArcManifest,
 } from "../types.js";
 import { normalizeDeclaredSecrets } from "./secrets.js";
+import type { InventoryEntry } from "./composition-inventory.js";
+import type { OwnsClass } from "./owns.js";
 
 /**
  * Initialize (or open) the packages database.
@@ -130,6 +132,39 @@ export function openDatabase(dbPath: string): Database {
     );
   `);
 
+  // The install-time INVENTORY SNAPSHOT of the whole composition (arc#401,
+  // docs/design-factory-type.md D6 — #365's NON-NEGOTIABLE).
+  //
+  // `composition_members` says WHAT the composition is; this says what it PUT
+  // ON THE MACHINE. `arc purge <factory>` re-checks every row against disk
+  // afterwards, and the resulting diff — empty except user-data refusals — is
+  // the acceptance test for untangle symmetry.
+  //
+  // The shape is `arc files`' output, one row per line it would print: an
+  // `owns:` row stores the DECLARATION (re-expanded at diff time, because a
+  // package's runtime creates those paths AFTER install — see the header of
+  // lib/composition-inventory.ts, which owns the semantics), every other row a
+  // resolved absolute path. `present` is liveness at install.
+  //
+  // Cascades off the composition header, like membership: a composition that
+  // has been purged has no inventory, and `arc purge` computes its diff from
+  // the rows it read into memory BEFORE tearing the record down.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS composition_inventory (
+      composition_name TEXT NOT NULL,
+      member_name TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      -- '' rather than NULL for a non-owns row: SQLite permits NULLs in the
+      -- PRIMARY KEY of a rowid table, so a nullable column here would silently
+      -- stop de-duplicating the very rows the diff walks.
+      owns_class TEXT NOT NULL DEFAULT '',
+      entry TEXT NOT NULL,
+      present INTEGER NOT NULL,
+      PRIMARY KEY (composition_name, member_name, kind, owns_class, entry),
+      FOREIGN KEY (composition_name) REFERENCES compositions(name) ON DELETE CASCADE
+    );
+  `);
+
   return db;
 }
 
@@ -213,17 +248,159 @@ export function beginComposition(
   tx();
 }
 
-/** Mark one member as landed (arc#400 F3). No-op for an unknown member. */
+/**
+ * What a member row's `state` means once the member has been dealt with.
+ *
+ * `landed` — this composition installed it. `preexisting` — it was ALREADY
+ * installed, by something arc does not otherwise track, and this composition
+ * merely referenced it (arc#401).
+ */
+export type CompositionMemberState = "pending" | "landed" | "preexisting";
+
+/**
+ * Mark one member as dealt with (arc#400 F3; the `preexisting` state is
+ * arc#401's addition). No-op for an unknown member.
+ *
+ * ## Why `preexisting` is recorded, and recorded HERE
+ *
+ * `arc purge <factory>` cascades to the members the factory installed
+ * (refcounted per arc#349). "The members the factory installed" is not the
+ * same set as "the members the factory references": a package the operator had
+ * installed by hand before the factory existed was not put there by this
+ * decision, so undoing the decision must not take it away. That fact is only
+ * knowable at install (`InstallResult.alreadyInstalled`), and is worthless
+ * unless persisted — so it is persisted, on the row that already exists for it.
+ *
+ * The caller must NOT mark a member `preexisting` merely because it was already
+ * installed: another COMPOSITION may have installed it, and that referent is
+ * already tracked in `composition_members`. Marking it here too would make the
+ * member immortal — retained by the pre-existing rule long after the other
+ * composition went away, which is precisely the "falls with the last referent"
+ * guarantee D3 asks for. install.ts resolves that with
+ * {@link compositionsReferencing} before choosing the state.
+ */
 export function markCompositionMemberLanded(
   db: Database,
   compositionName: string,
   memberName: string,
+  state: CompositionMemberState = "landed",
 ): void {
   const now = new Date().toISOString();
   db.prepare(
-    "UPDATE composition_members SET state = 'landed' WHERE composition_name = ? AND member_name = ?",
-  ).run(compositionName, memberName);
+    "UPDATE composition_members SET state = ? WHERE composition_name = ? AND member_name = ?",
+  ).run(state, compositionName, memberName);
   db.prepare("UPDATE compositions SET updated_at = ? WHERE name = ?").run(now, compositionName);
+}
+
+/**
+ * The compositions that list `memberName` as a member — the refcount
+ * denominator for arc#401's cascade, and the guard install.ts uses before
+ * recording a member as `preexisting`.
+ *
+ * `exclude` drops one composition from the answer (the caller's own). Pending
+ * compositions COUNT: an interrupted install is a referent whose members may
+ * yet be resumed or explicitly purged, and arc#349's posture on a refcount it
+ * cannot be sure about is to RETAIN. Ordered by name so the reason string a
+ * caller renders is stable.
+ */
+export function compositionsReferencing(
+  db: Database,
+  memberName: string,
+  opts: { exclude?: string } = {},
+): string[] {
+  const rows = db
+    .prepare(
+      "SELECT composition_name FROM composition_members WHERE member_name = ? ORDER BY composition_name",
+    )
+    .all(memberName) as { composition_name: string }[];
+  return rows
+    .map((r) => r.composition_name)
+    .filter((name) => name !== opts.exclude);
+}
+
+/**
+ * Delete a composition record outright — header, membership and inventory
+ * (arc#401).
+ *
+ * `removeSkill` already does this as part of removing the composition's own
+ * package. This is the path for the case that has no package to remove: an
+ * INTERRUPTED install, whose `skills` row never committed, leaves a `pending`
+ * header that nothing else can reach. Purging that debris is D6 serving the
+ * interrupted case.
+ */
+export function removeComposition(db: Database, compositionName: string): void {
+  db.prepare("DELETE FROM compositions WHERE name = ?").run(compositionName);
+}
+
+/**
+ * One row of the install-time inventory snapshot (arc#401 D6).
+ *
+ * The SHAPE is owned by `lib/composition-inventory.ts` (which knows what an
+ * owns class is and how to re-check one against disk); db.ts only persists it.
+ * A type-only import, so the two modules cannot form a runtime cycle.
+ */
+export type CompositionInventoryRow = InventoryEntry;
+
+/**
+ * Record the composition's install-time inventory (arc#401 D6).
+ *
+ * Replace-not-merge, exactly like `beginComposition`: the snapshot describes
+ * ONE release's footprint, so a re-install or an upgrade replaces it rather
+ * than accumulating the union of every release that was ever installed — a
+ * union whose diff would report long-deleted paths as leaks forever.
+ */
+export function recordCompositionInventory(
+  db: Database,
+  compositionName: string,
+  entries: readonly CompositionInventoryRow[],
+): void {
+  const insert = db.prepare(`
+    INSERT OR REPLACE INTO composition_inventory
+      (composition_name, member_name, kind, owns_class, entry, present)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM composition_inventory WHERE composition_name = ?").run(compositionName);
+    for (const row of entries) {
+      insert.run(
+        compositionName,
+        row.member,
+        row.kind,
+        row.ownsClass ?? "",
+        row.entry,
+        row.present ? 1 : 0,
+      );
+    }
+  });
+  tx();
+}
+
+/** The install-time inventory recorded for `compositionName` (arc#401 D6). */
+export function compositionInventory(
+  db: Database,
+  compositionName: string,
+): CompositionInventoryRow[] {
+  const rows = db
+    .prepare(
+      "SELECT member_name, kind, owns_class, entry, present FROM composition_inventory WHERE composition_name = ? ORDER BY member_name, kind, entry",
+    )
+    .all(compositionName) as {
+    member_name: string;
+    kind: string;
+    owns_class: string;
+    entry: string;
+    present: number;
+  }[];
+  return rows.map((r) => ({
+    member: r.member_name,
+    kind: r.kind,
+    // The column is a plain TEXT; the writer only ever puts an OwnsClass or ''
+    // in it, and the diff treats anything non-userData as purgeable, so a
+    // hand-edited value degrades to "must be gone" rather than to a crash.
+    ownsClass: r.owns_class === "" ? null : (r.owns_class as OwnsClass),
+    entry: r.entry,
+    present: r.present === 1,
+  }));
 }
 
 /**

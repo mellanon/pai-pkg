@@ -1113,8 +1113,18 @@ export async function installCompositionMembers(
      * to `capabilityRows(member.manifest)` — the same walk the review used.
      */
     reviewedRowsFor?: (member: ResolvedCompositionMember) => CapabilityRowLike[];
-    /** Called after each member lands, so the caller can mark it on the record (F3). */
-    onMemberLanded?: (member: ResolvedCompositionMember, landedName?: string) => void;
+    /**
+     * Called after each member lands, so the caller can mark it on the record
+     * (F3). `alreadyInstalled` threads the one fact arc#401's purge cascade
+     * cannot recover later: whether THIS composition put the member there, or
+     * merely found it. A member it found is not a member its removal may take
+     * away (D6) — see `markCompositionMemberLanded`.
+     */
+    onMemberLanded?: (
+      member: ResolvedCompositionMember,
+      landedName?: string,
+      alreadyInstalled?: boolean,
+    ) => void;
   } = {},
 ): Promise<{ success: boolean; error?: string; landed: string[] }> {
   const log = opts.log ?? ((line: string) => { console.log(line); });
@@ -1142,7 +1152,7 @@ export async function installCompositionMembers(
     }
 
     landed.push(member.reference.name);
-    opts.onMemberLanded?.(member, result.name);
+    opts.onMemberLanded?.(member, result.name, result.alreadyInstalled);
 
     // F2 — did what landed match what was approved?
     if (opts.recordedRowsFor && opts.reviewedRowsFor && result.name) {
