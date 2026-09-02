@@ -135,10 +135,44 @@ export interface FactoryCompositionResult {
 // ── Grammar ──────────────────────────────────────────────────
 
 /**
- * An EXACT pin: `major.minor.patch` with an optional prerelease and NO build
- * metadata. No leading `v` — a stored registry version does not carry one.
+ * An EXACT pin: BYTE-FOR-BYTE the registry's storage grammar, from
+ * meta-factory `src/lib/semver.ts` —
+ * `/^(\d+)\.(\d+)\.(\d+)(?:-([a-zA-Z0-9.]+))?$/` — read on 2026-09-02, not
+ * assumed. A pin is exact when it names a version the registry can actually
+ * hold, so the registry's grammar IS the definition; anything arc invents on
+ * top is a place the two gates can disagree.
+ *
+ * Two consequences worth naming, because they point in opposite directions
+ * (F7):
+ *
+ *   - TIGHTER than arc's first cut, which allowed a hyphen inside the
+ *     prerelease (`1.2.3-rc-1`). The registry's prerelease class is
+ *     `[a-zA-Z0-9.]+` with no hyphen, so arc was accepting pins that could
+ *     never resolve — a real gap, now closed.
+ *   - DELIBERATELY NOT tightened against leading zeros (`1.02.3`). The
+ *     official SemVer 2.0.0 grammar forbids them; the registry's `\d+` does
+ *     not, so `1.02.3` is a version it can store and resolve. Refusing it
+ *     arc-side would invent a false refusal against a legitimately published
+ *     version and break the exact property this mirror exists for. If the
+ *     registry ever tightens, this follows it — that is the direction the
+ *     dependency runs.
+ *
+ * Build metadata is excluded by construction rather than by a separate rule,
+ * which is the same S2 derivation the registry made (see `isExactPin`).
+ * No leading `v` — a stored registry version does not carry one.
  */
-const EXACT_PIN_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$/;
+const EXACT_PIN_RE = /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?$/;
+
+/**
+ * A reference `name`: the grammar `arc publish` already enforces on a package
+ * name (`VALID_NAME_RE`, lib/bundle.ts). Checked locally so a path-shaped or
+ * otherwise junk name is refused before it is ever handed to a resolver — the
+ * resolver will be a network client, and a name is not the place to find out.
+ */
+const REFERENCE_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
+
+/** A reference `scope`: the BARE namespace, no `@` sigil (cf. arc#369). */
+const REFERENCE_SCOPE_RE = /^[a-z0-9-]+$/;
 
 /** `produces:` is a lowercase capability slug — `software`, `research`. */
 const PRODUCES_RE = /^[a-z0-9][a-z0-9-]*$/;
@@ -146,7 +180,15 @@ const PRODUCES_RE = /^[a-z0-9][a-z0-9-]*$/;
 /** A `tools[].name` is a bare command name — no path, no arguments. */
 const TOOL_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 
-/** A version floor is an exact semver. A range is not a floor. */
+/**
+ * A version floor is an exact semver. A range is not a floor.
+ *
+ * Deliberately NOT `EXACT_PIN_RE`: this is the version of a HOST BINARY
+ * (`git 2.43.0`, `bun 1.2.0`), which the registry never stores, so the
+ * registry's storage grammar has no authority over it. Real tools do ship
+ * hyphenated prereleases, and refusing those would be arc inventing a rule
+ * about software it does not distribute.
+ */
 const TOOL_FLOOR_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$/;
 
 const MAX_PRODUCES_LENGTH = 64;
@@ -189,7 +231,41 @@ export function referenceLabel(ref: FactoryReference): string {
   return ref.scope ? `@${ref.scope}/${ref.name}` : ref.name;
 }
 
-/** The least-trusted tier in `tiers`, or null for an empty list (D5). */
+/**
+ * The identity key two references are the same package under: the scoped
+ * label, lowercased.
+ *
+ * Both halves matter (F3/F4). SCOPED, because `@other/software-factory` is a
+ * different package from `software-factory` and the self-reference check was
+ * falsely refusing the former. LOWERCASED, because package names are lowercase
+ * by grammar, so a case variant is the same package spelled wrong — and a
+ * duplicate the author cannot see is worse than one they can.
+ */
+function referenceKey(ref: FactoryReference): string {
+  return referenceLabel(ref).toLowerCase();
+}
+
+/** The composition's OWN identity key, in the same space as `referenceKey`. */
+function selfKey(manifest: Record<string, unknown>): string | null {
+  const name = manifest.name;
+  if (typeof name !== "string" || name.length === 0) return null;
+  const scope = manifest.namespace;
+  return referenceKey({
+    name,
+    version: "",
+    ...(typeof scope === "string" && scope.length > 0 ? { scope } : {}),
+  });
+}
+
+/**
+ * The least-trusted tier in `tiers`, or null for an empty list (D5).
+ *
+ * This ranks by index, so an unrecognized value would score -1 and drop
+ * silently out of the MIN. That is why `isManifestTier` gates every value on
+ * the way IN (see `resolveMembers`) rather than being trusted to be
+ * type-correct: `ManifestTier` is erased at runtime and the resolver that
+ * feeds this will be parsing registry JSON.
+ */
 export function minTier(tiers: readonly ManifestTier[]): ManifestTier | null {
   let worstRank = -1;
   for (const tier of tiers) {
@@ -199,8 +275,13 @@ export function minTier(tiers: readonly ManifestTier[]): ManifestTier | null {
   return worstRank === -1 ? null : TIER_TRUST_ORDER[worstRank];
 }
 
-function isManifestTier(value: unknown): value is ManifestTier {
+export function isManifestTier(value: unknown): value is ManifestTier {
   return typeof value === "string" && (TIER_TRUST_ORDER as readonly string[]).includes(value);
+}
+
+/** `"core", "official", "community", "custom"` — for a refusal message. */
+function tierVocabulary(): string {
+  return TIER_TRUST_ORDER.map((t) => `"${t}"`).join(", ");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -258,21 +339,64 @@ export function validateFactoryComposition(
     return { errors, warnings, computedTier: null };
   }
 
+  const { nameErrors, wellFormed } = checkReferenceNames(references);
+  errors.push(...nameErrors);
   errors.push(...checkExactPins(references));
   errors.push(...checkDuplicates(references));
 
+  // Only well-formed references reach the resolver. It will be a network
+  // client, and "is this even a package name?" is not a question to answer
+  // over the wire — nor a junk string to put in a URL.
+  if (wellFormed.length === 0) {
+    return { errors, warnings, computedTier: null };
+  }
+
   const { resolved, resolutionErrors, resolutionWarnings } = resolveMembers(
-    references,
-    manifest.name,
+    wellFormed,
+    selfKey(manifest),
     options.resolveMember,
   );
   errors.push(...resolutionErrors);
   warnings.push(...resolutionWarnings);
 
   const computedTier = minTier(resolved.map((m) => m.tier));
-  errors.push(...checkDeclaredTier(manifest.tier, computedTier, resolved));
+  const { tierErrors, tierWarnings } = checkDeclaredTier(manifest.tier, computedTier, resolved);
+  errors.push(...tierErrors);
+  warnings.push(...tierWarnings);
 
   return { errors, warnings, computedTier };
+}
+
+/**
+ * F4 — a reference name is checked against arc's own package-name grammar
+ * before it goes anywhere near a resolver. The resolver is a network client;
+ * "is this even a package name?" is not a question to answer over the wire.
+ */
+function checkReferenceNames(references: readonly FactoryReference[]): {
+  nameErrors: string[];
+  wellFormed: FactoryReference[];
+} {
+  const nameErrors: string[] = [];
+  const wellFormed: FactoryReference[] = [];
+  for (const ref of references) {
+    let ok = true;
+    if (!REFERENCE_NAME_RE.test(ref.name)) {
+      ok = false;
+      nameErrors.push(
+        `Invalid reference name "${ref.name}". A package name is lowercase alphanumeric with ` +
+          `hyphens, dots or underscores — the same grammar arc publishes names under.`,
+      );
+    }
+    if (ref.scope !== undefined && !REFERENCE_SCOPE_RE.test(ref.scope)) {
+      ok = false;
+      nameErrors.push(
+        `Invalid reference scope "${ref.scope}" (on "${ref.name}"). A scope is the BARE ` +
+          `lowercase namespace — no "@" sigil, no slashes (arc#369).`,
+      );
+    }
+    if (ok) wellFormed.push(ref);
+  }
+  return { nameErrors, wellFormed };
 }
 
 /** Read and shape-check `references[]`. Returns null when unusable. */
@@ -346,32 +470,37 @@ function checkDuplicates(references: readonly FactoryReference[]): string[] {
   const seen = new Set<string>();
   const reported = new Set<string>();
   for (const ref of references) {
-    const label = referenceLabel(ref);
-    if (seen.has(label)) {
-      if (!reported.has(label)) {
-        reported.add(label);
+    // Keyed case-insensitively (F4): `cortex` and `Cortex` name one package,
+    // and a duplicate the author cannot see is worse than one they can.
+    const key = referenceKey(ref);
+    if (seen.has(key)) {
+      if (!reported.has(key)) {
+        reported.add(key);
         errors.push(
-          `Duplicate reference "${label}". A member appears once in a composition — two pins for ` +
-            `the same member make the frozen snapshot ambiguous.`,
+          `Duplicate reference "${referenceLabel(ref)}". A member appears once in a composition — ` +
+            `two pins for the same member make the frozen snapshot ambiguous.`,
         );
       }
       continue;
     }
-    seen.add(label);
+    seen.add(key);
   }
   return errors;
 }
 
 function resolveMembers(
   references: readonly FactoryReference[],
-  selfName: unknown,
+  self: string | null,
   resolveMember: MemberResolver | undefined,
 ): { resolved: ResolvedMember[]; resolutionErrors: string[]; resolutionWarnings: string[] } {
   const resolutionErrors: string[] = [];
   const resolutionWarnings: string[] = [];
 
   for (const ref of references) {
-    if (typeof selfName === "string" && ref.name === selfName) {
+    // Compared on the SCOPED key (F3). Bare-name comparison falsely refused
+    // `@other/software-factory` from a manifest named `software-factory` —
+    // a different package that happens to share a name.
+    if (self !== null && referenceKey(ref) === self) {
       resolutionErrors.push(
         `Reference "${referenceLabel(ref)}" is the composition itself. A composition cannot ` +
           `reference itself.`,
@@ -385,7 +514,9 @@ function resolveMembers(
     resolutionErrors.push(
       `Cannot resolve this composition's members: no publish-time member resolver is available. ` +
         `arc refuses to freeze a snapshot it cannot verify rather than publish an unchecked one ` +
-        `(docs/design-factory-type.md D4/D5). Unresolved: ` +
+        `(docs/design-factory-type.md D4/D5). This is not a fault in your manifest — composition ` +
+        `publishing is not wired up yet: arc#366 stocks the shelf arc-side, and meta-factory#573 ` +
+        `maps references[] onto the registry's intake envelope. Unresolved: ` +
         references.map((r) => `${referenceLabel(r)}@${r.version}`).join(", ") +
         `.`,
     );
@@ -403,6 +534,27 @@ function resolveMembers(
       );
       continue;
     }
+    // F1 — gate the tier ON THE WAY IN. `ManifestTier` is erased at runtime,
+    // so the type annotation on ResolvedMember guarantees nothing about what a
+    // real resolver returns, and a real resolver parses registry JSON. An
+    // unrecognized value used to score -1 in `minTier` and drop silently out of
+    // the MIN: one bad member weakened the check, and ALL bad members disabled
+    // D5 outright while publish reported clean.
+    //
+    // REFUSE rather than clamp. Clamping to `custom` would invent a trust level
+    // nobody declared; clamping to the member's claim would trust the very
+    // string we failed to recognize. A resolver speaking a vocabulary arc does
+    // not know is a seam failure, and a seam failure is not a package the
+    // author can fix by editing their manifest — so it says so.
+    if (!isManifestTier(member.tier)) {
+      resolutionErrors.push(
+        `Member "${referenceLabel(ref)}"@${ref.version} resolved with an unrecognized tier ` +
+          `"${String(member.tier)}". A factory's tier is the MIN of its members' (D5) and arc ` +
+          `cannot rank a tier it does not know, so it refuses rather than quietly dropping the ` +
+          `member from the computation. Valid tiers: ${tierVocabulary()}.`,
+      );
+      continue;
+    }
     if (member.revoked) {
       // WARN, not refuse — DD-108 publish-refresh posture.
       resolutionWarnings.push(
@@ -416,26 +568,65 @@ function resolveMembers(
   return { resolved, resolutionErrors, resolutionWarnings };
 }
 
-/** D5 — declared tier may equal or under-claim the MIN, never exceed it. */
+/**
+ * D5 — declared tier may equal or under-claim the MIN, never exceed it.
+ *
+ * Three cases, kept distinct (F2/F6). The original single
+ * `!isManifestTier(declared) -> return` guard was written for the ABSENT case
+ * and silently swallowed the MALFORMED one with it, so `tier: Official` sailed
+ * past D5 entirely — the one typo that turns the check off.
+ *
+ *   - ABSENT: tolerated, because tier is an optional manifest field arc-wide
+ *     and this slice is not the place to make it mandatory. But it WARNS with
+ *     the computed value, so D5 is never silently vacuous (F6).
+ *   - MALFORMED: refused, naming the valid vocabulary.
+ *   - PRESENT and valid: ranked against the MIN as before.
+ */
 function checkDeclaredTier(
   declaredRaw: unknown,
   computedTier: ManifestTier | null,
   resolved: readonly ResolvedMember[],
-): string[] {
-  if (computedTier === null) return [];
-  if (!isManifestTier(declaredRaw)) return [];
+): { tierErrors: string[]; tierWarnings: string[] } {
+  const tierErrors: string[] = [];
+  const tierWarnings: string[] = [];
+
+  if (declaredRaw !== undefined && declaredRaw !== null && !isManifestTier(declaredRaw)) {
+    // A non-string tier is a schema mistake; render it as JSON rather than
+    // `[object Object]` so the author sees what they actually wrote.
+    const shown = typeof declaredRaw === "string" ? declaredRaw : JSON.stringify(declaredRaw);
+    tierErrors.push(
+      `Declared tier "${shown}" is not a recognized tier, so D5 cannot rank it ` +
+        `against the members' computed MIN. Valid tiers: ${tierVocabulary()}.`,
+    );
+    return { tierErrors, tierWarnings };
+  }
+
+  if (computedTier === null) return { tierErrors, tierWarnings };
+
+  if (!isManifestTier(declaredRaw)) {
+    // Absent. Say what the composition WOULD be, so the omission is visible.
+    tierWarnings.push(
+      `No tier declared. Computed from members, this composition's tier is "${computedTier}" ` +
+        `(the MIN of its members', D5). Declare it explicitly so the manifest says what the ` +
+        `registry will publish.`,
+    );
+    return { tierErrors, tierWarnings };
+  }
 
   const declaredRank = TIER_TRUST_ORDER.indexOf(declaredRaw);
   const computedRank = TIER_TRUST_ORDER.indexOf(computedTier);
-  if (declaredRank >= computedRank) return [];
+  if (declaredRank >= computedRank) return { tierErrors, tierWarnings };
 
-  const weakest = resolved.filter((m) => m.tier === computedTier).map((m) => `"${m.name}"@${m.version}`);
-  return [
+  const weakest = resolved
+    .filter((m) => m.tier === computedTier)
+    .map((m) => `"${m.name}"@${m.version}`);
+  tierErrors.push(
     `Declared tier "${declaredRaw}" is above the computed tier "${computedTier}". A factory's tier ` +
       `is the MIN of its members' (docs/design-factory-type.md D5) — trust never averages up. ` +
       `Least-trusted member(s) at "${computedTier}": ${weakest.join(", ")}. ` +
       `Declare "${computedTier}" or raise the member.`,
-  ];
+  );
+  return { tierErrors, tierWarnings };
 }
 
 // ── D1: tools + produces ─────────────────────────────────────

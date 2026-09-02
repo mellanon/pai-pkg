@@ -9,6 +9,7 @@ import {
   isExactPin,
   referenceLabel,
   TIER_TRUST_ORDER,
+  type ManifestTier,
   type MemberResolver,
   type ResolvedMember,
 } from "../../src/lib/factory-references.js";
@@ -396,5 +397,242 @@ describe("arc#402 — happy path: a well-formed factory publishes", () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain("cortex");
     expect(result.error).toContain("^6.1.0");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// Review round 2 on 8e5010a (F1–F7)
+// ═════════════════════════════════════════════════════════════
+
+/**
+ * F1 — the tier vocabulary is a SEAM, and a seam that accepts an unknown value
+ * silently is not a seam. `minTier` ranks by index into TIER_TRUST_ORDER, so a
+ * resolver returning `experimental` scored -1 and simply dropped out of the
+ * MIN. The real resolver will wrap registry JSON, which is exactly where an
+ * unrecognized string arrives from. Refuse, do not clamp: clamping invents a
+ * trust level nobody declared.
+ */
+describe("arc#402 F1 — an unrecognized member tier is refused, not dropped", () => {
+  test("ONE unknown tier: the member is named with its bad value, and D5 is not skipped", () => {
+    const result = validateForPublish(factoryManifest({ tier: "official" }), {
+      resolveMember: tableResolver({
+        cortex: { name: "cortex", version: "6.1.0", tier: "official" },
+        "compass-core": {
+          name: "compass-core",
+          version: "0.9.3",
+          tier: "experimental" as ManifestTier,
+        },
+      }),
+    });
+
+    expect(result.valid).toBe(false);
+    const offender = result.errors.find((e) => e.includes("experimental"));
+    expect(offender).toBeDefined();
+    expect(offender).toContain("compass-core");
+    // The valid vocabulary is spelled out — the resolver author has to know it.
+    expect(offender).toContain("official");
+  });
+
+  test("EVERY tier unknown: publish is refused rather than skipping D5 entirely", () => {
+    // The nastier probe. With every member unrecognized the computed MIN was
+    // null, checkDeclaredTier returned early, and a factory declaring
+    // `official` published clean with its tier never checked against anything.
+    const result = validateForPublish(factoryManifest({ tier: "official" }), {
+      resolveMember: (ref) => ({
+        name: ref.name,
+        version: ref.version,
+        tier: "experimental" as ManifestTier,
+      }),
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.errors.filter((e) => e.includes("experimental")).length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+/**
+ * F2 — the `!isManifestTier(declared)` guard was written for an ABSENT tier and
+ * silently swallowed a MALFORMED one too, so `tier: Official` skipped D5.
+ */
+describe("arc#402 F2 — a malformed declared tier is refused, an absent one is not", () => {
+  test("`Official` is refused, naming the valid tiers", () => {
+    const result = validateForPublish(factoryManifest({ tier: "Official" }), {
+      resolveMember: resolveAllOfficial,
+    });
+
+    expect(result.valid).toBe(false);
+    const offender = result.errors.find((e) => e.includes("Official"));
+    expect(offender).toBeDefined();
+    for (const tier of TIER_TRUST_ORDER) expect(offender).toContain(tier);
+  });
+
+  test("an ABSENT tier stays tolerated — F6's warning covers it, not a refusal", () => {
+    const m = factoryManifest();
+    delete m.tier;
+    const result = validateForPublish(m, { resolveMember: resolveAllOfficial });
+    expect(result.valid).toBe(true);
+  });
+});
+
+/**
+ * F3 — the self-reference check compared bare names, so a genuinely different
+ * package that happens to share a name in another scope was falsely refused.
+ */
+describe("arc#402 F3 — self-reference is decided on the scoped label", () => {
+  test("the same name in a DIFFERENT scope is a different package, and is allowed", () => {
+    const result = validateForPublish(
+      factoryManifest({
+        references: [{ scope: "other", name: "software-factory", version: "1.0.0" }],
+      }),
+      { resolveMember: resolveAllOfficial },
+    );
+    expect(result.errors.filter((e) => /itself/i.test(e))).toEqual([]);
+    expect(result.valid).toBe(true);
+  });
+
+  test("a true self-reference is still refused", () => {
+    const result = validateForPublish(
+      factoryManifest({ references: [{ name: "software-factory", version: "1.0.0" }] }),
+      { resolveMember: resolveAllOfficial },
+    );
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => /itself/i.test(e))).toBe(true);
+  });
+
+  test("a scoped self-reference matching the manifest's own namespace is refused", () => {
+    const result = validateForPublish(
+      factoryManifest({
+        namespace: "metafactory",
+        references: [{ scope: "metafactory", name: "software-factory", version: "1.0.0" }],
+      }),
+      { resolveMember: resolveAllOfficial },
+    );
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => /itself/i.test(e))).toBe(true);
+  });
+});
+
+/**
+ * F4 — reference names were never checked against a name grammar, and the
+ * duplicate/self checks were case-sensitive.
+ */
+describe("arc#402 F4 — reference names are validated locally and matched case-insensitively", () => {
+  test("a case-variant duplicate is caught", () => {
+    const result = validateForPublish(
+      factoryManifest({
+        references: [
+          { name: "cortex", version: "6.1.0" },
+          { name: "Cortex", version: "6.2.0" },
+        ],
+      }),
+      { resolveMember: resolveAllOfficial },
+    );
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => /duplicate/i.test(e))).toBe(true);
+  });
+
+  test("a path-shaped reference name is refused, and never reaches the resolver", () => {
+    // The resolver will be a network client; a junk name must not become part
+    // of a URL. Asserted, not assumed.
+    const seen: string[] = [];
+    const spy: MemberResolver = (ref) => {
+      seen.push(ref.name);
+      return { name: ref.name, version: ref.version, tier: "official" };
+    };
+
+    const result = validateForPublish(
+      factoryManifest({
+        references: [
+          { name: "../../etc/passwd", version: "1.0.0" },
+          { name: "cortex", version: "6.1.0" },
+        ],
+      }),
+      { resolveMember: spy },
+    );
+
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("../../etc/passwd"))).toBe(true);
+    expect(seen).toEqual(["cortex"]);
+  });
+
+  test("a malformed scope is refused", () => {
+    const result = validateForPublish(
+      factoryManifest({ references: [{ scope: "Not A Scope", name: "cortex", version: "1.0.0" }] }),
+      { resolveMember: resolveAllOfficial },
+    );
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("Not A Scope"))).toBe(true);
+  });
+});
+
+/** F5 — a refusal an operator cannot act on is a dead end. */
+describe("arc#402 F5 — the no-resolver refusal says what unblocks it", () => {
+  test("the message names the tracking issues", () => {
+    const result = validateForPublish(factoryManifest());
+    const offender = result.errors.find((e) => /resolve/i.test(e));
+    expect(offender).toBeDefined();
+    expect(offender).toContain("#366");
+    expect(offender).toContain("meta-factory#573");
+  });
+});
+
+/** F6 — D5 must not be silently vacuous when no tier is declared. */
+describe("arc#402 F6 — the computed tier is surfaced", () => {
+  test("PublishValidation carries computedTier", () => {
+    const result = validateForPublish(factoryManifest(), { resolveMember: resolveAllOfficial });
+    expect(result.valid).toBe(true);
+    expect(result.computedTier).toBe("official");
+  });
+
+  test("an ABSENT declared tier warns, naming the computed MIN", () => {
+    const m = factoryManifest();
+    delete m.tier;
+    const result = validateForPublish(m, {
+      resolveMember: tableResolver({
+        cortex: { name: "cortex", version: "6.1.0", tier: "official" },
+        "compass-core": { name: "compass-core", version: "0.9.3", tier: "community" },
+      }),
+    });
+
+    expect(result.valid).toBe(true);
+    expect(result.computedTier).toBe("community");
+    expect(result.warnings.some((w) => /tier/i.test(w) && w.includes("community"))).toBe(true);
+  });
+
+  test("a non-composition publish leaves computedTier null", () => {
+    const result = validateForPublish({
+      name: "my-skill",
+      version: "1.0.0",
+      type: "skill",
+      description: "x",
+    });
+    expect(result.valid).toBe(true);
+    expect(result.computedTier).toBeNull();
+  });
+});
+
+/**
+ * F7 — the pin grammar is DERIVED from what the registry can store, and the
+ * registry's storage grammar was read rather than assumed:
+ * meta-factory `src/lib/semver.ts` — `/^(\d+)\.(\d+)\.(\d+)(?:-([a-zA-Z0-9.]+))?$/`.
+ */
+describe("arc#402 F7 — the pin grammar matches the registry's storage grammar exactly", () => {
+  test("a HYPHENATED prerelease is refused — the registry cannot store it", () => {
+    // The real gap this found: arc was LOOSER than the registry here, so it
+    // would have accepted a pin that could never resolve.
+    expect(isExactPin("1.2.3-rc-1")).toBe(false);
+    expect(isExactPin("1.2.3-rc.1")).toBe(true);
+  });
+
+  test("an empty prerelease is refused", () => {
+    expect(isExactPin("1.2.3-")).toBe(false);
+  });
+
+  test("a leading zero is ACCEPTED, deliberately — the registry stores it", () => {
+    // Not a tightening. The registry's storage grammar is `\d+` per component,
+    // so `1.02.3` is a version it can hold and resolve. Refusing it arc-side
+    // would invent a false refusal and break the property the whole mirror
+    // exists for: the two gates agreeing.
+    expect(isExactPin("1.02.3")).toBe(true);
   });
 });

@@ -222,15 +222,38 @@ refusing a composition declaration on a type that will never read it.
 `createBundle` forwards the same options, so `arc bundle` and `arc publish`
 apply one gate rather than two.
 
-**Grammar agreement with the registry.** The exact-pin rule mirrors
-meta-factory#574 (`src/lib/factory-checks.ts`), including its refusal of
-SemVer build metadata: the registry stores no `1.2.3+build` version, so such
-a pin can never resolve, and SemVer compares `1.0.0+a` and `1.0.0+b` EQUAL,
-so it is not a unique pin either. Both ends refuse it with a targeted
-message rather than a generic "not exact", because a build-metadata pin
-LOOKS exact to its author. arc's own manifest-version grammar still accepts
-build metadata — a different question (what a version may look like) from
-this one (what a pin may resolve to).
+**Grammar agreement with the registry.** The exact-pin grammar is not
+mirrored by hand, it IS the registry's storage grammar — meta-factory
+`src/lib/semver.ts`, `/^(\d+)\.(\d+)\.(\d+)(?:-([a-zA-Z0-9.]+))?$/`, read on
+2026-09-02 rather than assumed. A pin is exact when it names a version the
+registry can actually hold, so the registry's grammar is the definition;
+anything arc invents on top is a place the two gates can disagree.
+
+Two consequences, pointing in opposite directions, both deliberate:
+
+- Build metadata is refused BY CONSTRUCTION (the grammar has no `+` branch)
+  — the same S2 derivation meta-factory#574 made: the registry stores no
+  `1.2.3+build` version so such a pin can never resolve, and SemVer compares
+  `1.0.0+a` and `1.0.0+b` EQUAL so it is not a unique pin either. Both ends
+  refuse it with a TARGETED message rather than a generic "not exact",
+  because a build-metadata pin looks exact to its author.
+- Leading zeros (`1.02.3`) are ACCEPTED, against the official SemVer 2.0.0
+  grammar. The registry's per-component class is `\d+`, so `1.02.3` is a
+  version it can store and resolve; refusing it arc-side would invent a false
+  refusal against a legitimately published version and break the property
+  this mirror exists for. If the registry tightens, arc follows — that is the
+  direction the dependency runs.
+
+Reading the registry's source also closed a real gap in the other direction:
+arc's first cut allowed a hyphen inside the prerelease (`1.2.3-rc-1`), which
+the registry's `[a-zA-Z0-9.]+` cannot store. arc was accepting pins that
+could never resolve.
+
+arc's own manifest-VERSION grammar (bundle.ts, validate-manifest.ts) still
+accepts build metadata — a different question (what a version may look like)
+from this one (what a pin may resolve to). So is `tools[].min_version`,
+which is a HOST BINARY's version and which the registry never stores; it
+keeps the looser grammar on purpose.
 
 **Where member tiers come from at publish — the judgement call.** D5
 computes the factory's tier from its members, so the source of member tiers
@@ -251,6 +274,19 @@ which is itself fail-closed for composition publishing until meta-factory#573
 maps `manifest.references[]` onto the intake envelope — the two gates agree,
 including on what they cannot yet do. Live-registry publishing of a real
 factory is HELD under #366 regardless.
+
+**The tier vocabulary is a seam, and it is checked.** `ManifestTier` is
+erased at runtime, so the type annotation on a resolver's return value
+guarantees nothing about what a real (registry-JSON-parsing) resolver
+actually hands back. An unrecognized tier is REFUSED, naming the member and
+the value — not clamped. Clamping to `custom` would invent a trust level
+nobody declared, and clamping to the member's claim would trust the very
+string arc failed to recognize. The failure this closes: because `minTier`
+ranks by index, an unknown value scored -1 and dropped silently out of the
+MIN, so one bad member weakened D5 and ALL bad members disabled it outright
+while publish reported clean. A malformed DECLARED tier (`Official`) is
+refused for the same reason — it used to fall through the guard written for
+an absent one, which is the single typo that turns D5 off.
 
 **Revocation.** A resolved-but-revoked member WARNs at publish-refresh and
 does not refuse: the author may be publishing precisely to move off it. The

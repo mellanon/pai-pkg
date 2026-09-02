@@ -176,6 +176,7 @@ export function validateForPublish(
     warnings,
     name: manifest.name ?? "",
     version: manifest.version ?? "",
+    computedTier: composition.computedTier,
   };
 }
 
