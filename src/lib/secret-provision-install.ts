@@ -102,13 +102,6 @@ export async function installTimeProvisionSecrets(
     return { success: true, stored: [], skipped: [] };
   }
 
-  const backend = backendForManifest(manifest, opts.arc, {
-    platform: opts.platform,
-    username: opts.username,
-    backend: opts.backend,
-    backendChoice: opts.backendChoice,
-  });
-
   // arc#358: announce the storage mechanism BEFORE the first prompt so the
   // questionnaire is not opaque — the operator should know these values are
   // stored via `arc secrets <pkg>`, that any can be skipped, and that they can
@@ -123,6 +116,25 @@ export async function installTimeProvisionSecrets(
   }
 
   try {
+    // arc#412 — CONSTRUCTION IS PART OF THE FALLIBLE WORK, here too. Both
+    // backends `assertAgentName` in their constructor, so a manifest whose name
+    // is not a package-name slug (a scoped `@scope/pkg`) throws from `new
+    // FileBackend`. Built outside this try, that throw escaped
+    // `installTimeProvisionSecrets` entirely and crashed `arc install` — past
+    // the fail-closed-loud contract documented above, and past install's own
+    // postinstall rollback (arc#373). Inside it, the same failure returns the
+    // clean `success: false` the caller already knows how to unwind.
+    //
+    // Unlike the purge path (which degrades — a namespace that cannot be opened
+    // has nothing to clear), install FAILS CLOSED: a declared secret that cannot
+    // be stored is a real, unmet install requirement.
+    const backend = backendForManifest(manifest, opts.arc, {
+      platform: opts.platform,
+      username: opts.username,
+      backend: opts.backend,
+      backendChoice: opts.backendChoice,
+    });
+
     const result = await provisionSecrets(manifest, {
       agent: manifest.name,
       backend,
