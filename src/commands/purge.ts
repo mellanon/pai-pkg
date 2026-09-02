@@ -94,6 +94,20 @@ export interface PurgeKept {
 
 export type PurgeScriptOutcome = "none" | "absent" | "ran" | "failed";
 
+/**
+ * A package whose secret namespace could not be OPENED at all (arc#412) — so
+ * it had nothing to purge, and the reason why.
+ *
+ * NAMES and reasons only. The reason comes from the storage layer, which is
+ * name-scoped by construction and never embeds a value.
+ */
+export interface PurgeSecretsSkipped {
+  /** The package whose namespace could not be opened. */
+  name: string;
+  /** Why the backend could not be built (e.g. `invalid agent name "…"`). */
+  reason: string;
+}
+
 export interface PurgeResult {
   success: boolean;
   name?: string;
@@ -107,6 +121,13 @@ export interface PurgeResult {
   keptUserData: PurgeKept[];
   /** Secret NAMES cleared from the package's namespace (never values). */
   secretsCleared: string[];
+  /**
+   * Packages whose secret namespace could not be opened, so nothing was cleared
+   * for them (arc#412). Empty on the happy path. NEVER silent: `formatPurge`
+   * prints a line per entry, because a purge that quietly skipped a namespace
+   * is the residue `arc purge` exists to prevent.
+   */
+  secretsSkipped: PurgeSecretsSkipped[];
   /** scripts.purge outcome. */
   purgeScript: PurgeScriptOutcome;
   /** Cascaded dependency names that THEMSELVES declare owns (dep-purge is out of
@@ -202,6 +223,7 @@ export async function purge(
       deletions: [],
       keptUserData: [],
       secretsCleared: [],
+      secretsSkipped: [],
       purgeScript: "none",
       cascadedOwns: [],
     };
@@ -216,6 +238,11 @@ export async function purge(
   const keptUserData = planUserData(owns, home);
 
   if (opts.dryRun) {
+    // arc#412 — the plan must promise only what the purge can deliver. A scope
+    // whose backend cannot be built clears nothing, so the plan says so here
+    // rather than listing names the real run will silently pass over. Building
+    // the backend is side-effect-free, which is what makes this safe in a plan.
+    const planned = openSecretBackend(name, arc, opts);
     return {
       success: true,
       name,
@@ -225,7 +252,8 @@ export async function purge(
         status: d.liveness === "present" ? ("planned" as const) : ("absent" as const),
       })),
       keptUserData,
-      secretsCleared: declaredSecretNames(manifest),
+      secretsCleared: planned.skipped ? [] : declaredSecretNames(manifest),
+      secretsSkipped: planned.skipped ? [planned.skipped] : [],
       purgeScript: purgeScriptState(manifest, skill.install_path),
       cascadedOwns: [],
     };
@@ -253,6 +281,7 @@ export async function purge(
       deletions: [],
       keptUserData,
       secretsCleared: [],
+      secretsSkipped: [],
       purgeScript: "none",
       cascadedOwns: [],
     };
@@ -292,8 +321,9 @@ export async function purge(
     purgeScript = "absent"; // declared but the script file was not on disk
   }
 
-  // (c) Clear the package's arc secrets namespace.
-  const secretsCleared = await clearSecrets(name, arc, manifest, opts);
+  // (c) Clear the package's arc secrets namespace. Degrades to a reported skip
+  //     when the namespace cannot be opened at all (arc#412).
+  const secrets = await clearSecrets(name, arc, manifest, opts);
 
   // (d) Cascade note: name any cascaded dep that itself declares owns.
   const cascadedOwns = (removed.cascaded ?? [])
@@ -307,7 +337,8 @@ export async function purge(
     removed,
     deletions,
     keptUserData,
-    secretsCleared,
+    secretsCleared: secrets.cleared,
+    secretsSkipped: secrets.skipped ? [secrets.skipped] : [],
     purgeScript,
     cascadedOwns,
   };
@@ -416,6 +447,10 @@ async function purgeComposition(
         ...memberPlans.flatMap((p) => p.secretsCleared),
         ...(factoryPlan?.secretsCleared ?? []),
       ],
+      secretsSkipped: [
+        ...memberPlans.flatMap((p) => p.secretsSkipped),
+        ...(factoryPlan?.secretsSkipped ?? []),
+      ],
       purgeScript: factoryPlan?.purgeScript ?? "none",
       cascadedOwns: [],
       composition: {
@@ -450,6 +485,7 @@ async function purgeComposition(
   const deletions: PurgeDeletion[] = [];
   const keptUserData: PurgeKept[] = [];
   const secretsCleared: string[] = [];
+  const secretsSkipped: PurgeSecretsSkipped[] = [];
 
   for (const member of teardownOrder) {
     const referents = await memberReferents(db, name, member, record.started_at);
@@ -471,6 +507,7 @@ async function purgeComposition(
     deletions.push(...result.deletions);
     keptUserData.push(...result.keptUserData);
     secretsCleared.push(...result.secretsCleared);
+    secretsSkipped.push(...result.secretsSkipped);
   }
 
   // 3. THE FACTORY LAST — and with it the record. A `pending` composition has
@@ -487,6 +524,7 @@ async function purgeComposition(
         deletions,
         keptUserData,
         secretsCleared,
+        secretsSkipped,
         composition: {
           status: record.status,
           purged,
@@ -500,6 +538,7 @@ async function purgeComposition(
     deletions.push(...factoryResult.deletions);
     keptUserData.push(...factoryResult.keptUserData);
     secretsCleared.push(...factoryResult.secretsCleared);
+    secretsSkipped.push(...factoryResult.secretsSkipped);
   } else {
     removeComposition(db, name);
   }
@@ -512,6 +551,7 @@ async function purgeComposition(
     deletions,
     keptUserData,
     secretsCleared,
+    secretsSkipped,
     purgeScript: factoryResult?.purgeScript ?? "none",
     cascadedOwns: factoryResult?.cascadedOwns ?? [],
     composition: {
@@ -729,6 +769,38 @@ async function snapshotPurgeScript(
 }
 
 /**
+ * Build the secret backend for a package scope, or say why it cannot be built
+ * (arc#412). The ONLY construction site on the purge path — the dry-run plan
+ * and the real clear both go through it, so the plan cannot promise a namespace
+ * the purge will then skip.
+ *
+ * Construction is fallible on purpose: both backends `assertAgentName` in their
+ * constructor, and that guard is right — a scoped name carries a `/`, which
+ * would escape `<secretsRoot>/<agent>/`. Failing there must not be fatal, only
+ * reported; see {@link clearSecrets}.
+ */
+function openSecretBackend(
+  name: string,
+  arc: ArcPaths,
+  opts: PurgeOptions,
+): { backend: SecretBackend; skipped?: undefined } | { backend?: undefined; skipped: PurgeSecretsSkipped } {
+  try {
+    const backend =
+      opts.makeSecretBackend?.(name) ??
+      resolveSecretBackend(name, {
+        platform: process.platform,
+        secretsRoot: arc.secretsDir,
+        username: currentUsername(),
+        backendChoice: opts.secretBackend,
+      });
+    return { backend };
+  } catch (err) {
+    // errorMessage is name-scoped — the storage layer never embeds a value.
+    return { skipped: { name, reason: errorMessage(err) } };
+  }
+}
+
+/**
  * Clear the package's `arc secrets` namespace.
  *
  * Mechanism: the store is per-package namespaced. FileBackend keeps
@@ -737,21 +809,47 @@ async function snapshotPurgeScript(
  * SecretListUnsupportedError). So: enumerate via `list()` when supported, else
  * fall back to the manifest-declared names, and `remove()` each — then sweep the
  * now-empty FileBackend agent dir. Values never touched, never logged.
+ *
+ * ## Why the CONSTRUCTOR is inside the try (arc#412)
+ *
+ * Both backends call `assertAgentName` in their constructor, and that guard is
+ * correct — a scoped name carries a `/`, which would escape
+ * `<secretsRoot>/<agent>/`. What was wrong was WHERE the constructor ran: it sat
+ * outside this function's error handling, on a path the composition cascade
+ * re-enters once per member. A member with a scoped manifest name
+ * (`@the-metafactory/compass-core` — compass-core's documented, deliberate
+ * arc/v1 name violation) threw `invalid agent name` from `new FileBackend`,
+ * which propagated through `purge()` and `purgeComposition()` and killed the
+ * whole cascade with most of the composition still installed (factory E2E gate
+ * F1).
+ *
+ * The degradation is sound, not a paper-over: a namespace that cannot be OPENED
+ * cannot have been WRITTEN BY ARC either. The guard has run in the constructor
+ * since the backends landed (#234), so no arc version has ever created such a
+ * namespace — there is no arc-written state under it to purge or to leak. A
+ * hand-planted directory at that path does survive, and surfaces as reported
+ * residue in the untangle diff, which is the right outcome for something arc did
+ * not put there. Returning early also keeps the unvalidated `name` out of the
+ * `rm` sweep below, which is the other reason not to simply catch-and-continue
+ * past the construction.
+ *
+ * It is degraded, never silent: the caller threads the skip into the purge
+ * report by name and reason.
  */
 async function clearSecrets(
   name: string,
   arc: ArcPaths,
   manifest: ArcManifest | null,
   opts: PurgeOptions,
-): Promise<string[]> {
-  const backend =
-    opts.makeSecretBackend?.(name) ??
-    resolveSecretBackend(name, {
-      platform: process.platform,
-      secretsRoot: arc.secretsDir,
-      username: currentUsername(),
-      backendChoice: opts.secretBackend,
-    });
+): Promise<{ cleared: string[]; skipped: PurgeSecretsSkipped | null }> {
+  const resolved = openSecretBackend(name, arc, opts);
+  if (!resolved.backend) {
+    if (!opts.quiet) {
+      process.stderr.write(`  ⚠ no secrets to purge for '${name}': ${resolved.skipped.reason}\n`);
+    }
+    return { cleared: [], skipped: resolved.skipped };
+  }
+  const backend = resolved.backend;
 
   let names: string[];
   try {
@@ -781,7 +879,7 @@ async function clearSecrets(
   const agentDir = join(arc.secretsDir, name);
   if (existsSync(agentDir)) await rm(agentDir, { recursive: true, force: true }).catch(() => {/* best-effort cleanup; nothing to recover */});
 
-  return cleared;
+  return { cleared, skipped: null };
 }
 
 function currentUsername(): string {
@@ -855,6 +953,13 @@ export function formatPurge(result: PurgeResult): string {
 
   if (result.secretsCleared.length > 0) {
     lines.push(`  secrets cleared: ${result.secretsCleared.join(", ")}`);
+  }
+
+  // arc#412 — a namespace arc could not open is a REPORTED gap, next to the
+  // namespaces it did clear. The reason is included because the operator is the
+  // only one who can act on it (here, by fixing the package's name).
+  for (const skip of result.secretsSkipped) {
+    lines.push(`  no secrets to purge for ${skip.name}: ${skip.reason}`);
   }
 
   if (result.purgeScript === "ran") lines.push("  scripts.purge: ran");

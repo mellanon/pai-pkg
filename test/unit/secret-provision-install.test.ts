@@ -89,6 +89,40 @@ describe("installTimeProvisionSecrets", () => {
     expect(r.success).toBe(false);
     expect(r.error).toContain("Secret provisioning failed");
   });
+
+  /**
+   * arc#412 — the backend CONSTRUCTOR is fallible (`assertAgentName`), and it
+   * used to run outside this function's try. A manifest with a scoped name
+   * therefore crashed `arc install` with an unhandled throw instead of the
+   * fail-closed-loud result the caller unwinds cleanly (and rolls back per
+   * arc#373). Install still FAILS here — a declared secret it cannot store is a
+   * genuinely unmet requirement — it just fails as a value, not as a crash.
+   */
+  test("an unbuildable backend fails closed rather than throwing (#412)", async () => {
+    const scoped: ArcManifest = {
+      name: "@the-metafactory/compass-core",
+      version: "0.1.0",
+      type: "agent",
+      capabilities: { secrets: ["GITHUB_TOKEN"] },
+    };
+
+    // No injected backend: this must exercise the REAL construction.
+    const r = await installTimeProvisionSecrets(scoped, {
+      arc,
+      platform: "linux", // FileBackend — no host keychain involved
+      username: "tester",
+      fromEnv: true,
+      env: { GITHUB_TOKEN: "gh_pat_value" },
+      quiet: true,
+    });
+
+    expect(r.success).toBe(false);
+    expect(r.error).toContain("Secret provisioning failed");
+    expect(r.error).toContain("invalid agent name");
+    expect(r.stored).toEqual([]);
+    expect(r.skipped).toEqual(["GITHUB_TOKEN"]);
+    expect(JSON.stringify(r)).not.toContain("gh_pat_value");
+  });
 });
 
 describe("buildSecretEnvForInstall", () => {
