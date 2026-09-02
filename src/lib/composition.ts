@@ -49,6 +49,7 @@ import type {
   ToolRequirement,
 } from "../types.js";
 import { BASH_UNRESTRICTED, capabilityRows } from "./db.js";
+import { PURGEABLE_OWNS_CLASSES, ownsEntriesOverlap } from "./owns.js";
 import { satisfiesRange } from "./semver.js";
 import type { Violation } from "./validate-manifest.js";
 
@@ -690,6 +691,67 @@ export function formatCombinedCapabilityReview(opts: {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// D6 — cross-member owns overlap (arc#401 review, F4)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Does any member's DELETABLE `owns` entry overlap another member's
+ * `owns.userData`? (arc#401 review, F4.)
+ *
+ * `validateOwns` already refuses this WITHIN one manifest, on the rule that
+ * userData is never deleted and so must not overlap a class purge deletes. A
+ * composition breaks the assumption that manifest holds: each member can be
+ * individually valid while the union is not. Reproduced — member A declares
+ * `~/alpha-workspace` as userData, member B declares
+ * `~/alpha-workspace/cache` as state; `arc purge <factory>` then deletes
+ * inside A's user data and reports that same path KEPT in the very same
+ * report. That is the apt `/home` guarantee failing while claiming to hold,
+ * which is worse than failing loudly.
+ *
+ * Refused at composition time (before anything lands) rather than repaired at
+ * purge time. A purge-time fix would have to decide which member wins, and
+ * there is no safe answer: skipping B's deletion leaves state a purge promised
+ * to remove, honouring it deletes A's user data. The authors have to
+ * reconcile the paths, and the earliest arc can say so is while it still costs
+ * the operator nothing.
+ *
+ * Both directions of containment count, and equality counts, for the same
+ * reason `validateOwns` takes both: nesting either way puts a deletable path
+ * and a never-delete path in one subtree. Comparison is segment-aware on
+ * tilde-expanded, glob-stripped roots — the identical primitive, imported
+ * rather than re-derived, so the single-manifest gate and this one cannot
+ * disagree about what "overlaps" means.
+ *
+ * Pure: returns one human line per conflict, naming BOTH members and BOTH
+ * paths, and empty when there is nothing to say.
+ */
+export function compositionOwnsConflicts(
+  members: readonly CompositionMemberSurface[],
+): string[] {
+  const conflicts: string[] = [];
+
+  for (const keeper of members) {
+    for (const ud of keeper.manifest.owns?.userData ?? []) {
+      for (const deleter of members) {
+        if (deleter.name === keeper.name) continue; // same-manifest overlap is validateOwns' job
+        for (const cls of PURGEABLE_OWNS_CLASSES) {
+          for (const entry of deleter.manifest.owns?.[cls] ?? []) {
+            if (!ownsEntriesOverlap(ud, entry)) continue;
+            conflicts.push(
+              `'${keeper.name}' declares userData '${ud}' and '${deleter.name}' declares ${cls} '${entry}' — ` +
+                `they overlap on disk. userData is NEVER deleted, so purging this composition would delete inside ` +
+                `'${keeper.name}'s user data while reporting it kept. Reconcile the paths in the two manifests.`,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return conflicts;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // D5 — tier is the MIN of the members'
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -986,6 +1048,24 @@ export async function prepareComposition(opts: {
   const surfaces = members.map(memberSurface);
   const surface = aggregateCapabilities(surfaces);
 
+  // 4a. CROSS-MEMBER owns overlap (arc#401 review, F4). Each member's own
+  //     manifest already passed `validateOwns`; the UNION is a different
+  //     question, and the answer to it decides whether `arc purge` can keep the
+  //     never-touch promise it prints. Refused here — before the operator is
+  //     asked anything, and long before anything lands — because at purge time
+  //     there is no safe way to choose between deleting a member's declared
+  //     state and preserving another member's user data.
+  const ownsConflicts = compositionOwnsConflicts(surfaces);
+  if (ownsConflicts.length > 0) {
+    return refuse(
+      [
+        `Refusing to install '${manifest.name}': its members' owns declarations overlap across the composition.`,
+        ...ownsConflicts.map((c) => `  ${c}`),
+        "userData is the one thing arc promises never to delete (docs/design-factory-type.md D6). Nothing was installed.",
+      ].join("\n"),
+    );
+  }
+
   const tierWarning = tierMinWarning(manifest.tier, surfaces);
   if (tierWarning) warn(tierWarning);
 
@@ -1125,6 +1205,21 @@ export async function installCompositionMembers(
       landedName?: string,
       alreadyInstalled?: boolean,
     ) => void;
+    /**
+     * Does the name a member LANDED under disagree with the name the reference
+     * gave it? (arc#401 review, ROOT 1.) Returns a refusal message, or null.
+     *
+     * Bound by install.ts to `memberIdentityRefusal`. This module stays free of
+     * the identity policy for the same reason it stays free of the database:
+     * the comparison is one line and its justification is a page, and the page
+     * belongs where the canonical key is defined. Absent ⇒ the check is
+     * skipped, which is what keeps a stub installer (one that reports no landed
+     * name at all) working unchanged.
+     */
+    identityRefusalFor?: (
+      member: ResolvedCompositionMember,
+      landedName: string,
+    ) => string | null;
   } = {},
 ): Promise<{ success: boolean; error?: string; landed: string[] }> {
   const log = opts.log ?? ((line: string) => { console.log(line); });
@@ -1149,6 +1244,21 @@ export async function installCompositionMembers(
           `Failed to install composition member '${label}': ${result.error ?? "unknown error"}`,
         ),
       };
+    }
+
+    // ROOT 1 — IDENTITY, before anything is recorded about this member. A
+    // package that landed under a different name than the reference gave it
+    // was reviewed under someone else's name and would be recorded under a key
+    // nothing installed; both halves of that are worse than a refusal, and the
+    // second is what made `arc purge` report a clean untangle over an installed
+    // member. Checked here rather than after the loop so the members that
+    // already landed are named in the error, like every other failure below.
+    if (result.name && opts.identityRefusalFor) {
+      const refusal = opts.identityRefusalFor(member, result.name);
+      if (refusal) {
+        landed.push(member.reference.name);
+        return { success: false, landed, error: withDebris(refusal) };
+      }
     }
 
     landed.push(member.reference.name);

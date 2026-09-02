@@ -70,8 +70,14 @@ export function list(db: Database, opts?: ListOptions): ListResult {
  * sweep looks for compositions that need finishing or cleaning up.
  */
 export function formatListJson(result: ListResult): string {
+  // `name` is the name the member LANDED under — the `skills.name` a consumer
+  // can join on (arc#401 review, ROOT 1). `label` is what `references[]` called
+  // it, and appears ONLY when the two differ (which is every `@scope/name`
+  // member), so a composition whose labels already are manifest names emits
+  // byte-identical JSON to before.
   const memberJson = (m: CompositionMemberRow) => ({
     name: m.member_name,
+    ...(m.member_label && m.member_label !== m.member_name ? { label: m.member_label } : {}),
     version: m.member_version,
     source: m.member_source,
     ref: m.member_ref,

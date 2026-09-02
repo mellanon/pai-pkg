@@ -42,6 +42,7 @@
 import { existsSync } from "fs";
 import { expandOwnsEntry, pathLiveness, type OwnsClass } from "./owns.js";
 import { listPackageHooks } from "./hooks.js";
+import { canonicalMemberKey } from "./composition-identity.js";
 
 /**
  * The `kind` a snapshot row carries for an `owns:` declaration. Everything
@@ -90,12 +91,25 @@ export interface InventoryResidue {
  * The D6 verdict: what a purge left behind, split by whether arc MEANT to.
  *
  * `refusals` is `owns.userData` — named and kept, the apt `/home` guarantee
- * (purge.ts's never-touch rule). `residue` is everything else, and a
- * non-empty `residue` is a failed untangle.
+ * (purge.ts's never-touch rule). `residue` is everything else, and a non-empty
+ * `residue` is a failed untangle.
  */
 export interface InventoryDiff {
   residue: InventoryResidue[];
   refusals: InventoryResidue[];
+  /**
+   * Paths belonging to a member the cascade RETAINED on purpose — refcounting
+   * kept it because another composition or another package still needs it
+   * (arc#401 review, W2).
+   *
+   * A third bucket, not residue, because they are opposite verdicts. The
+   * snapshot names everything the composition put on the machine, and a
+   * retained member's footprint is legitimately still all of it; classifying
+   * that as residue made CORRECT refcounting render as a failed untangle, which
+   * is exactly how an operator learns to ignore the one line D6 exists to make
+   * trustworthy.
+   */
+  retained: InventoryResidue[];
 }
 
 /** The `arc files`-shaped input a snapshot is built from. */
@@ -151,6 +165,14 @@ export interface DiffOptions {
   home: string;
   /** `settings.json`, so a leftover hook registration is visible as residue. */
   settingsPath: string;
+  /**
+   * Member names the cascade RETAINED on purpose (arc#401 review, W2). Their
+   * rows are classified `retained` rather than `residue` — refcounting keeping
+   * a shared member is the design working, not the untangle failing. Compared
+   * canonically, so a snapshot row written under one spelling of the member's
+   * name still matches a retention decision recorded under another.
+   */
+  retainedMembers?: readonly string[];
 }
 
 /**
@@ -175,7 +197,11 @@ export function diffCompositionInventory(
 ): InventoryDiff {
   const residue: InventoryResidue[] = [];
   const refusals: InventoryResidue[] = [];
+  const retained: InventoryResidue[] = [];
   const hooksByPackage = new Map<string, { event: string; command: string }[]>();
+
+  const retainedKeys = new Set((opts.retainedMembers ?? []).map(canonicalMemberKey));
+  const isRetained = (member: string): boolean => retainedKeys.has(canonicalMemberKey(member));
 
   for (const entry of entries) {
     if (entry.kind === OWNS_KIND) {
@@ -187,7 +213,13 @@ export function diffCompositionInventory(
           ownsClass: entry.ownsClass,
           path,
         };
-        (entry.ownsClass === "userData" ? refusals : residue).push(row);
+        // userData is a refusal whoever owns it — the never-touch promise does
+        // not depend on whether the member stayed. A retained member's
+        // deletable paths are neither residue nor a refusal: they are still
+        // there because the package is still installed.
+        if (entry.ownsClass === "userData") refusals.push(row);
+        else if (isRetained(entry.member)) retained.push(row);
+        else residue.push(row);
       }
       continue;
     }
@@ -201,22 +233,29 @@ export function diffCompositionInventory(
       }
       const live = hooksByPackage.get(entry.member) ?? [];
       if (live.some((h) => h.command === entry.entry)) {
-        residue.push({
+        const row: InventoryResidue = {
           member: entry.member,
           kind: entry.kind,
           ownsClass: null,
           path: `${opts.settingsPath} :: ${entry.entry}`,
-        });
+        };
+        (isRetained(entry.member) ? retained : residue).push(row);
       }
       continue;
     }
 
     if (pathLiveness(entry.entry) === "present") {
-      residue.push({ member: entry.member, kind: entry.kind, ownsClass: null, path: entry.entry });
+      const row: InventoryResidue = {
+        member: entry.member,
+        kind: entry.kind,
+        ownsClass: null,
+        path: entry.entry,
+      };
+      (isRetained(entry.member) ? retained : residue).push(row);
     }
   }
 
-  return { residue, refusals };
+  return { residue, refusals, retained };
 }
 
 /** Human lines for a diff — the report `arc purge <factory>` prints. */
@@ -230,11 +269,22 @@ export function formatInventoryDiff(diff: InventoryDiff): string[] {
       lines.push(`    ✗ ${row.member} [${row.kind}] ${row.path}`);
     }
   }
-  // Worded as a VERIFICATION, not a second announcement: `formatPurge` already
-  // printed the "kept (user data)" plan line from the owns declaration. This
-  // line says the same path was checked afterwards and is genuinely still there.
+  if (diff.retained.length > 0) {
+    lines.push(
+      `    · ${diff.retained.length} path(s) retained by design — they belong to a member another referent still needs:`,
+    );
+    for (const row of diff.retained) {
+      lines.push(`        ${row.member} [${row.kind}] ${row.path}`);
+    }
+  }
+  // F9 — the two user-data lines describe OPPOSITE SIDES of the purge, and the
+  // wording says which. `formatPurge` prints the DECLARED plan line before
+  // anything is deleted (from the owns declaration, whether or not the path
+  // exists); this one is the post-purge check, and it appears only for paths
+  // arc went back and found. A declared path with nothing on disk is named
+  // above and absent here, which is correct and not a discrepancy.
   for (const row of diff.refusals) {
-    lines.push(`    · still present, as promised (user data): ${row.path}`);
+    lines.push(`    · verified still present after purge (user data): ${row.path}`);
   }
   return lines;
 }

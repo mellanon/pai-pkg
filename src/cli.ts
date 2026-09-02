@@ -718,6 +718,20 @@ program
             `   ↳ kept dependency ${kept.name} (still required by: ${kept.requiredBy.join(", ")})`,
           );
         }
+        // arc#401 review, S2: `remove` tears down THIS package only, so a
+        // factory's members survive it — and the composition record that knew
+        // they belonged together went with the factory. That boundary is right
+        // (it is the same one that leaves config/state for `purge`), but it must
+        // not be silent: name them, and name the command that takes them down
+        // as a set.
+        if (result.orphanedMembers?.length) {
+          console.log(
+            `   ⚠ ${result.orphanedMembers.length} composition member(s) remain installed and are no longer recorded as a set: ${result.orphanedMembers.join(", ")}`,
+          );
+          console.log(
+            `      \`arc remove --purge ${result.name}\` cascades to members refcounted; remove them individually now, or leave them if you still use them.`,
+          );
+        }
         // arc#359 + arc#373 defect A: name the runtime config/state remove
         // leaves on disk and point at an actionable next step. The formatter
         // never suggests a command that fails post-remove (the old `arc purge

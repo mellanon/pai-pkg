@@ -115,6 +115,7 @@ describe("arc#401 — planMemberMoves refuses rather than guesses", () => {
     {
       composition_name: "f",
       member_name: "alpha",
+      member_label: "alpha",
       member_version: "1.0.0",
       member_source: "repo",
       member_ref: "/tmp/alpha",
@@ -127,8 +128,42 @@ describe("arc#401 — planMemberMoves refuses rather than guesses", () => {
     const plan = planMemberMoves(recorded, [{ name: "alpha", version: "1.1.0" }]);
     expect(plan.ok).toBe(true);
     expect(plan.ok && plan.moves).toEqual([
-      { name: "alpha", from: "1.0.0", to: "1.1.0", ref: "/tmp/alpha" },
+      { name: "alpha", label: "alpha", from: "1.0.0", to: "1.1.0", ref: "/tmp/alpha" },
     ]);
+  });
+
+  test("a member whose LABEL is scoped still matches its recorded row (ROOT 1)", () => {
+    const scoped = [{ ...recorded[0], member_label: "@metafactory/alpha" }];
+    const plan = planMemberMoves(scoped, [{ name: "@metafactory/alpha", version: "1.1.0" }]);
+    expect(plan.ok).toBe(true);
+    expect(plan.ok && plan.moves.map((m) => m.name)).toEqual(["alpha"]);
+    // …and a release that re-spells the label is not read as a drop plus an add.
+    expect(planMemberMoves(scoped, [{ name: "Alpha", version: "1.1.0" }]).ok).toBe(true);
+  });
+
+  test("F7: a member whose repo URL changed between releases is refused, naming both", () => {
+    const plan = planMemberMoves(recorded, [
+      { name: "alpha", version: "1.1.0", repo: "/tmp/somewhere-else" },
+    ]);
+    expect(plan.ok).toBe(false);
+    expect(!plan.ok && plan.error).toContain("/tmp/alpha");
+    expect(!plan.ok && plan.error).toContain("/tmp/somewhere-else");
+  });
+
+  test("F7: a repo change at the SAME pin is still refused — the bytes would move", () => {
+    const plan = planMemberMoves(recorded, [
+      { name: "alpha", version: "1.0.0", repo: "/tmp/somewhere-else" },
+    ]);
+    expect(plan.ok).toBe(false);
+    expect(!plan.ok && plan.error).toContain("somewhere-else");
+  });
+
+  test("F7: notation-only URL differences are NOT a change", () => {
+    const plan = planMemberMoves(recorded, [
+      { name: "alpha", version: "1.1.0", repo: "/tmp/alpha.git" },
+    ]);
+    expect(plan.ok).toBe(true);
+    expect(plan.ok && plan.moves).toHaveLength(1);
   });
 
   test("an unchanged pin is not a move", () => {
@@ -161,7 +196,13 @@ describe("arc#401 — planMemberMoves refuses rather than guesses", () => {
     const plan = planMemberMoves(
       [
         recorded[0],
-        { ...recorded[0], member_name: "beta", member_version: "2.0.0", position: 1 },
+        {
+          ...recorded[0],
+          member_name: "beta",
+          member_label: "beta",
+          member_version: "2.0.0",
+          position: 1,
+        },
       ],
       [{ name: "alpha", version: "1.0.0" }],
     );

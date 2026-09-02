@@ -449,3 +449,77 @@ rollback is attempted (the same contract as arc#346's cascade). (c) The
 untangle diff verifies the paths the snapshot NAMED — a package that writes
 outside everything it declares is outside D6's reach by construction, which is
 the same boundary `owns:` has had since arc#359.
+
+### Review hardening (arc#401 second pass)
+
+Two review lanes on the first implementation found three root causes and nine
+adversarial findings, five of them with executed repros. All are closed; the
+repros are committed as regressions
+(`test/commands/composition-hardening-401.test.ts`). What changed, and why the
+first answers were wrong:
+
+**ROOT 1 — one identity for a member.** Membership was keyed on the raw
+`references[].name` LABEL, while `skills.name` is the member's MANIFEST name.
+Every `@scope/name` member differs across those two by construction, so the
+snapshot, the purge cascade and the refcount all looked up a package that was
+not there: `arc purge <factory>` printed `untangle: CLEAN` over a fully
+installed member with its config still on disk, and a member shared under a
+case-variant label was deleted out from under the composition that needed it.
+
+The fix is a canonical key — scope-stripped, lowercased
+(`lib/composition-identity.ts`) — plus storing BOTH names:
+`composition_members.member_name` is now what landed, `member_label` what the
+reference said. Scope-stripping rather than scope-preserving is the deliberate
+half: `skills.name` is a primary key over bare manifest names, so arc cannot
+hold `@a/foo` and `@b/foo` as two packages, and a key finer-grained than the
+table it joins against is exactly how the label key failed. A GENUINE mismatch
+(not a scope difference) is now a refusal at landing, because the combined
+review attributed that member's surface to the label. `packagesRequiring`
+(#349's own denominator) compares canonically too — a missed requirer is a
+deletion, so widening the match only ever retains more.
+
+**ROOT 2 — `preexisting` means nobody tracked installed it.** The predicate
+was "does another composition MENTION this member", which is not "did another
+composition PUT IT THERE". Under it, a second factory referencing a package the
+operator had installed by hand recorded it `landed`, and purging the two
+factories in order deleted the operator's package. `compositionsInstalling`
+(state `landed` only) replaces `compositionsReferencing` at that call site.
+Two more windows in the same predicate: a RESUMED install re-marked its own
+members `preexisting` (immortal, and reported as residue forever) — closed by
+reading the prior self-states before `beginComposition` wipes them; and
+upgrade's two-step record rewrite exposed an all-`pending` intermediate whose
+kill erased the fact permanently — closed by `replaceCompositionRecord`, one
+transaction, which throws rather than write an ambiguous membership. The one
+remaining case (a row still `pending` because an INSTALL was killed mid-flight)
+has no recorded answer at all, so it falls back to `installed_at <
+started_at` — evidence too weak for the general predicate, strictly better than
+nothing here, and failing in the RETAIN direction.
+
+**ROOT 3 — honest reports, and the rest.** A retained member's paths are
+legitimately still on disk, and counting them as residue made CORRECT
+refcounting render as a failed untangle; they are a third bucket now
+(`InventoryDiff.retained`). The purge order is reversed — members first,
+factory (and the record) LAST — because taking the record down first left a
+window where a killed purge orphaned the members behind a name that then
+refused, which is the state the command exists to prevent. Cross-member `owns`
+overlap is refused before anything lands: two individually-valid manifests can
+compose into a union where one member's `state` sits inside another's
+`userData`, and purging then deleted user data while reporting it kept — the
+`/home` guarantee failing while claiming to hold. It is refused at composition
+time rather than repaired at purge time because at purge time there is no safe
+choice between the two members. `arc upgrade` now refuses on an unreadable
+remote (not knowing the plan is a reason to stop, never to do half of it), on a
+member whose repo URL changed between releases (a pinned member is a
+determinism claim about bytes, not a version number — checked even at an
+unchanged pin), and in pre-flight on a dirty member worktree. A mixed-state
+upgrade records `status: 'partial'` at the versions actually installed, so
+`arc list` flags it and a retry re-plans instead of reporting "already at".
+`arc install --pin` on a composition refuses and names `arc upgrade`; plain
+`arc remove <factory>` now says which members it orphaned.
+
+**Residual risk after hardening.** The install-side `pending` window is
+narrowed, not eliminated — a kill between opening the record and marking a
+member leaves a row whose only evidence is a timestamp. `partial` compositions
+are re-planned but never rolled back. And the canonical key collapses two
+registry scopes that share a bare name, which is a distinction arc's `skills`
+table has never been able to represent either.

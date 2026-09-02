@@ -11,7 +11,8 @@ import type {
   OwnsDeclaration,
 } from "../types.js";
 import { hasOwns, purgeableEntries, expandOwnsEntry, pathLiveness } from "../lib/owns.js";
-import { getSkill, removeSkill, listByLibrary, listSkills } from "../lib/db.js";
+import { getSkill, removeSkill, listByLibrary, listSkills, compositionMembers } from "../lib/db.js";
+import { canonicalMemberKey } from "../lib/composition-identity.js";
 import { removeSymlink, removeCliShim, extractAllCliInfo } from "../lib/symlinks.js";
 import { resolveProvidesTarget } from "../lib/provides-target.js";
 import { readManifest } from "../lib/manifest.js";
@@ -62,6 +63,21 @@ export interface RemoveResult {
    * out here means `remove` reads the manifest exactly once.
    */
   owns?: OwnsDeclaration;
+  /**
+   * arc#401 review, S2 — the composition members this removal ORPHANED.
+   *
+   * `arc remove <factory>` takes down the factory and, with it, the composition
+   * record (`removeSkill` drops the header; membership and inventory cascade).
+   * The members stay installed, and the only thing that knew they belonged
+   * together is gone — so `arc purge <factory>` can no longer cascade to them,
+   * and the operator is left to remember the list.
+   *
+   * That IS the right behaviour for `remove` (it tears down what arc installed
+   * for this package and nothing more — the same boundary that makes `remove`
+   * leave config/state for `purge`), but it must not be silent. Present only
+   * when the removed package had recorded members.
+   */
+  orphanedMembers?: string[];
 }
 
 /**
@@ -224,7 +240,12 @@ export async function packagesRequiring(
       continue;
     }
     const declared = pkgManifest.depends_on?.packages ?? [];
-    if (declared.some((d) => d.name === depName)) {
+    // Compared through `canonicalMemberKey` (arc#401 review, ROOT 1): a
+    // dependency declared as `@scope/foo` or `Foo` names the same installed
+    // `foo`, and `skills.name` cannot hold both. A verbatim comparison MISSES
+    // such a requirer, and a missed requirer is a DELETION — the fail-unsafe
+    // direction. Widening the match only ever retains more.
+    if (declared.some((d) => canonicalMemberKey(d.name) === canonicalMemberKey(depName))) {
       requiredBy.push(pkg.name);
     }
   }
@@ -517,6 +538,13 @@ export async function remove(
   // remove kept-summary + purge.
   const ownsDecl = manifest?.owns;
 
+  // arc#401 review, S2: capture the composition membership before `removeSkill`
+  // drops the header and cascades it away. These packages survive this removal
+  // with nothing left recording that they belonged together, so the result says
+  // so and the CLI points at `arc purge` as the command that would have taken
+  // them down properly.
+  const orphanedMembers = compositionMembers(db, name).map((m) => m.member_name);
+
   // 1. Fire scripts.preremove (arc#138) — non-aborting on failure.
   if (manifest?.scripts?.preremove) {
     const preResult = runScript({
@@ -710,6 +738,7 @@ export async function remove(
       ...(cascaded.length ? { cascaded } : {}),
       ...(retained.length ? { retained } : {}),
       ...(hasOwns(ownsDecl) ? { owns: ownsDecl } : {}),
+      ...(orphanedMembers.length ? { orphanedMembers } : {}),
     };
   }
 
@@ -717,6 +746,7 @@ export async function remove(
     success: true,
     name,
     ...(hasOwns(ownsDecl) ? { owns: ownsDecl } : {}),
+    ...(orphanedMembers.length ? { orphanedMembers } : {}),
   };
 }
 
