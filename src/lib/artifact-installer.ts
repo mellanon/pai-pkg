@@ -55,6 +55,7 @@ export const INSTALLABLE_ARTIFACT_TYPES = ARTIFACT_TYPES;
  * Maps an artifact type to its conventional source subdirectory within a cloned repo.
  *
  * - rules, governance, component, tool -> baseDir (no subdirectory)
+ * - bundle, factory -> baseDir (compositions have no payload subdirectory)
  * - pipeline -> join(baseDir, "pipeline") if it exists, else baseDir
  * - agent -> join(baseDir, "agent")
  * - prompt -> join(baseDir, "prompt")
@@ -68,6 +69,18 @@ export function resolveArtifactSourceDir(type: ArtifactType | "rules" | "system"
     case "component":
     case "tool":
       return baseDir;
+
+    case "bundle":
+    case "factory": {
+      // COMPOSITION types (arc#399, docs/design-factory-type.md D1). Same
+      // explicit-case discipline as planArtifactSymlinks: a composition ships
+      // only its manifest, so there is no payload subdirectory to descend into
+      // and `baseDir` is the truthful answer. Named rather than left to the
+      // `default:` below, which would silently hand back `<baseDir>/skill` — a
+      // path that does not exist in a composition package, and exactly the kind
+      // of plausibly-wrong value a fall-through produces.
+      return baseDir;
+    }
 
     case "pipeline": {
       const pipelineDir = join(baseDir, "pipeline");

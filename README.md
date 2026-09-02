@@ -314,7 +314,7 @@ arc-skill-example/
 ```yaml
 name: _DOC
 version: 1.0.0
-type: skill                 # skill | tool | agent | prompt
+type: skill                 # see "Artifact types" below for the full list
 tier: community
 
 author:
@@ -343,6 +343,55 @@ capabilities:
   secrets: []
 ```
 
+### Artifact types
+
+`type:` is the single axis that tells arc what a package *is* and where it
+lands. The full set lives in one place in the code
+([`src/artifact-types.ts`](src/artifact-types.ts)) — the manifest validator, the
+installer and the publish validator all derive from it, so `arc validate`,
+`arc install` and `arc publish` can never disagree about which types exist.
+
+| `type:` | What it is | Where it lands |
+|---|---|---|
+| `skill` | A skill package (SKILL.md + workflows) | host `skills/` |
+| `system` | A skill-shaped package that is part of the system layer | host `skills/` |
+| `agent` | An agent definition or cortex bot pack | host `agents/` (cortex `agents.d/` + `personas/`) |
+| `prompt` | A slash command / prompt | host `prompts/` |
+| `tool` | A CLI tool | host `bin/` + a PATH shim |
+| `component` | A package that drops files only | wherever `provides.files` says |
+| `rules` | A template package that generates files into a consumer repo | the consumer repo |
+| `governance` | Governance overlays (SOPs, validators, CLAUDE.md engines) | `provides.files` / `provides.templates` |
+| `pipeline` | A pipeline definition | arc's `pipelines/` |
+| `action` | A single action definition | arc's `actions/` |
+| `process` | A packaged pulse process definition (D/A/H steps) | arc state |
+| `library` | **Composition:** one tarball, N artifacts inside it | each artifact installs at its own type's location |
+| `bundle` | **Composition:** a reference manifest — `references[]` name published packages | its members install at theirs |
+| `factory` | **Composition:** a `bundle` that also declares `tools:` and `produces:` | its members install at theirs |
+
+Compositions carry no artifact payload of their own, so they may omit the
+`capabilities:` block that every other type must declare: a composition's real
+capability surface is the union of its members', reviewed in one prompt at
+install time. `bundle` and `factory` reference resolution is landing
+incrementally — see
+[`docs/design-factory-type.md`](docs/design-factory-type.md).
+
+#### "bundle" means two different things — both are correct
+
+arc's repo-naming convention and the manifest type vocabulary use the same word
+for unrelated concepts. Both are intentional and both survive
+([`docs/design-factory-type.md`](docs/design-factory-type.md) D1) — the axes are
+independent, so a repo of one class can carry a manifest of any type.
+
+| | Repo-name class | Manifest type |
+|---|---|---|
+| **Written as** | a directory / repo named `metafactory-bundle-<name>` | `type: bundle` inside `arc-manifest.yaml` |
+| **What it means** | a *naming* convention for a repo shipping several related files together | the registry's reference-composition (DD-111): the tarball holds only a manifest, whose `references[]` name published packages |
+| **What it implies about `type:`** | nothing — its members declare an ordinary installable type | it *is* the type |
+| **Example** | `metafactory-bundle-discord` declares `type: skill`; `metafactory-bundle-content-filter` declares `type: tool` | a `software-factory` package declaring `type: factory`, whose `references[]` list cortex, compass-core, and the skills it composes |
+
+`factory` deliberately avoids reusing the word, so there is only ever one thing
+it can mean.
+
 ---
 
 ## Adapter / Renderer Plugin Bundles
@@ -352,8 +401,12 @@ adapter or renderer, per
 [ADR-0024](https://github.com/the-metafactory/cortex/blob/main/docs/adr/0024-pluggable-surface-adapters.md))
 ship their own npm dependencies (`discord.js`, `@slack/*`, …) alongside the usual
 `arc-manifest.yaml` + `package.json`. arc handles the dependency-install and
-compat-surfacing mechanics for any package that looks like this — there's no
-separate "bundle" artifact type or install verb.
+compat-surfacing mechanics for any package that looks like this — no special
+artifact type or install verb is involved, and "bundle" here is the everyday
+English word, not `type: bundle`. A plugin bundle declares an ordinary
+installable type (usually `skill` or `tool`); see
+[Artifact types](#artifact-types) for why the word carries two meanings and how
+to tell them apart.
 
 ### npm dependency install
 

@@ -291,15 +291,48 @@ function validateAuthor(manifest: Record<string, unknown>, add: Add): void {
 }
 
 /**
+ * The types exempt from the arc#240 capabilities-PRESENCE rule — the
+ * reference-composition types (arc#399, `docs/design-factory-type.md` D1/D2).
+ *
+ * Note how narrow this is. Strict mode deliberately does NOT copy the lenient
+ * loader's exemptions (`component`, `rules`, `agent` — manifest.ts): those
+ * packages HAVE a capability surface of their own, and arc#240 is precisely the
+ * rule that stops them omitting it. Only the compositions are listed, and only
+ * because they genuinely have no own-surface to declare.
+ */
+const CAPABILITIES_OPTIONAL_TYPES: readonly string[] = ["bundle", "factory"];
+
+/**
  * Validate the REQUIRED `capabilities` block (spec §4.1, arc#240). The block
  * must be present with its four canonical sub-blocks declared as explicit
  * empties — "never omitted" — so risk is never silently defaulted to `low`.
  * Network entries use the standardized `{ host, reason }` shape ONLY: the
  * string shorthand and the legacy `{ domain, reason }` shape are both rejected.
+ *
+ * ## Composition exemption (arc#399, D2)
+ *
+ * `bundle` and `factory` may omit the block entirely. arc#240's rationale is
+ * that a package must never let its OWN capability surface default silently to
+ * `low` — and a composition has no own surface: it ships no code, only a
+ * manifest whose `references[]` name other published packages. Its real surface
+ * is the UNION of its members', computed at install from the resolved
+ * references and presented as one combined review (D2). Demanding explicit
+ * empties here would make a factory ASSERT it is capability-free, which is a
+ * stronger and more misleading claim than saying nothing — the opposite of what
+ * arc#240 protects. It also keeps `arc validate` and `arc install` agreeing on a
+ * minimal composition manifest, instead of the validator rejecting exactly what
+ * the loader accepts.
+ *
+ * The exemption covers PRESENCE only. A composition that DOES declare a
+ * `capabilities:` block has it validated in full, exactly like any other type —
+ * an author who makes the claim is held to the schema.
  */
 function validateCapabilities(manifest: Record<string, unknown>, add: Add): void {
   const caps = manifest.capabilities;
   if (caps === undefined || caps === null) {
+    if (typeof manifest.type === "string" && CAPABILITIES_OPTIONAL_TYPES.includes(manifest.type)) {
+      return;
+    }
     add(
       "capabilities",
       "is a required block with explicit empties (filesystem/network/bash/secrets) — never omitted (arc#240)",

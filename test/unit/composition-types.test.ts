@@ -2,13 +2,16 @@ import { describe, test, expect, afterEach } from "bun:test";
 import { mkdir, writeFile } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
+import YAML from "yaml";
 import {
   createArtifactSymlinks,
   planArtifactSymlinks,
+  resolveArtifactSourceDir,
 } from "../../src/lib/artifact-installer.js";
 import { readManifest } from "../../src/lib/manifest.js";
 import { maybeProvisionAgentIdentity } from "../../src/lib/identity-provision.js";
 import { hostPathFor } from "../../src/lib/hosts/dispatch.js";
+import { validateStrictManifest } from "../../src/lib/validate-manifest.js";
 import { createTestEnv, type TestEnv } from "../helpers/test-env.js";
 
 /**
@@ -68,6 +71,100 @@ describe("arc#399 — composition manifests load without a capabilities block", 
       expect(manifest).not.toBeNull();
       expect(manifest!.type).toBe(type);
       expect(manifest!.capabilities).toBeUndefined();
+    });
+  }
+});
+
+/**
+ * A composition manifest that is strict-clean in every respect EXCEPT that it
+ * declares no `capabilities:` block. The repo dir name is deliberately a
+ * `metafactory-bundle-<name>` one carrying `type: factory`: D1's two axes are
+ * independent, and the §4.2 name derivation must not care which is which.
+ */
+function strictCompositionManifest(type: "bundle" | "factory"): Record<string, unknown> {
+  return {
+    schema: "arc/v1",
+    name: "software-factory",
+    version: "0.1.0",
+    type,
+    tier: "custom",
+    description: "The software factory composition.",
+    license: "Apache-2.0",
+    author: { name: "Jane Doe", github: "janedoe" },
+  };
+}
+
+describe("arc#399 — the two gates agree on a minimal composition manifest (D2)", () => {
+  for (const type of COMPOSITION_TYPES) {
+    test(`type: ${type} without capabilities passes BOTH readManifest and strict validate`, async () => {
+      env = await createTestEnv();
+      const manifestObj = strictCompositionManifest(type);
+
+      // Gate 1: the lenient loader `arc install` uses.
+      const dir = join(env.root, "metafactory-bundle-software-factory");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "arc-manifest.yaml"), YAML.stringify(manifestObj));
+      const loaded = await readManifest(dir);
+      expect(loaded).not.toBeNull();
+      expect(loaded!.capabilities).toBeUndefined();
+
+      // Gate 2: the strict validator `arc validate` uses. Before arc#399 this
+      // one rejected the exact manifest the loader had just accepted, with
+      // arc#240's explicit-empties message.
+      const violations = validateStrictManifest({
+        manifest: manifestObj,
+        repoDirName: "metafactory-bundle-software-factory",
+      });
+      expect(violations).toEqual([]);
+    });
+
+    test(`type: ${type} that DOES declare capabilities is still validated in full`, () => {
+      // The exemption is about PRESENCE only. An author who makes the claim is
+      // held to the arc#240 schema exactly like any other type — here the
+      // rejected legacy `{ domain, reason }` network shape (arc#335).
+      const violations = validateStrictManifest({
+        manifest: {
+          ...strictCompositionManifest(type),
+          capabilities: {
+            filesystem: { read: [], write: [] },
+            network: [{ domain: "api.example.com", reason: "legacy shape" }],
+            bash: { allowed: false },
+            secrets: [],
+          },
+        },
+        repoDirName: "metafactory-bundle-software-factory",
+      });
+      expect(violations.some((v) => v.field.startsWith("capabilities.network"))).toBe(true);
+    });
+
+    test(`type: ${type} with a malformed capabilities block is rejected, not exempted`, () => {
+      const violations = validateStrictManifest({
+        manifest: { ...strictCompositionManifest(type), capabilities: "none" },
+        repoDirName: "metafactory-bundle-software-factory",
+      });
+      expect(violations.some((v) => v.field === "capabilities")).toBe(true);
+    });
+  }
+
+  test("the exemption does NOT leak to non-composition types", () => {
+    // arc#240 still bites every type that has a surface of its own. Strict mode
+    // deliberately does not copy the loader's component/rules/agent exemptions.
+    for (const type of ["skill", "tool", "component", "rules", "agent", "library"] as const) {
+      const violations = validateStrictManifest({
+        manifest: { ...strictCompositionManifest("factory"), type },
+        repoDirName: "metafactory-bundle-software-factory",
+      });
+      expect(violations.some((v) => v.field === "capabilities")).toBe(true);
+    }
+  });
+});
+
+describe("arc#399 — resolveArtifactSourceDir names the composition types", () => {
+  for (const type of COMPOSITION_TYPES) {
+    test(`type: ${type} resolves to baseDir, not the default <baseDir>/skill`, () => {
+      const baseDir = "/tmp/arc-399-base";
+      expect(resolveArtifactSourceDir(type, baseDir)).toBe(baseDir);
+      expect(resolveArtifactSourceDir(type, baseDir)).not.toBe(join(baseDir, "skill"));
     });
   }
 });
