@@ -1,3 +1,4 @@
+import { ARTIFACT_TYPES } from "../types.js";
 import type {
   SearchOptions,
   SearchResult,
@@ -155,10 +156,18 @@ export function formatSearchJson(result: SearchResult): string {
   return JSON.stringify(output, null, 2);
 }
 
-/** Parse and validate an ArtifactType string from CLI */
+/**
+ * Parse and validate an ArtifactType string from CLI.
+ *
+ * Derived from the single source `ARTIFACT_TYPES` (arc#399 / D7.1) — this was a
+ * hand-copied list that had silently drifted, rejecting `--type system`,
+ * `--type rules`, `--type library`, `--type process` and `--type governance`
+ * even though packages of those types are installed and listed.
+ */
 export function parseArtifactType(input: string): ArtifactType | null {
-  const valid: ArtifactType[] = ["skill", "tool", "agent", "prompt", "component", "pipeline", "action"];
-  return valid.includes(input as ArtifactType) ? (input as ArtifactType) : null;
+  return (ARTIFACT_TYPES as readonly string[]).includes(input)
+    ? (input as ArtifactType)
+    : null;
 }
 
 /** Parse and validate a PackageTier string from CLI */

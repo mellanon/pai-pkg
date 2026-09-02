@@ -128,21 +128,30 @@ async function readManifestFromDir(
         return parsed;
       }
 
-      // capabilities optional for component, rules, and agent types, required for others.
+      // capabilities optional for component, rules, agent and the reference-
+      // composition types, required for others.
       // Persona-driven agents (arc#100 §12 / arc#102) declare authority via
       // `guardrails` instead of `capabilities` — the host enforces guardrails
       // through its own primitives (allowedDirs, disallowedTools, bashAllowlist),
       // so the per-package capabilities block does not apply.
+      // bundle/factory (arc#399, docs/design-factory-type.md D1/D2) carry no
+      // artifact payload of their own — a composition has nothing to declare.
+      // Its capability surface is the UNION of its members', computed at install
+      // from the resolved references and presented as one combined review (D2);
+      // demanding an explicit-empty block here would assert the composition is
+      // capability-free, which is exactly the wrong claim to make.
       if (
         !parsed.capabilities &&
         parsed.type !== "component" &&
         parsed.type !== "rules" &&
-        parsed.type !== "agent"
+        parsed.type !== "agent" &&
+        parsed.type !== "bundle" &&
+        parsed.type !== "factory"
       ) {
         throw new Error(
           [
             `Invalid ${filename}: missing required field 'capabilities'`,
-            `Required for type: skill, tool, prompt, pipeline, system (optional only for: component, rules, agent, process).`,
+            `Required for type: skill, tool, prompt, pipeline, system (optional only for: component, rules, agent, process, bundle, factory).`,
             ``,
             `Minimal example:`,
             ``,

@@ -38,6 +38,7 @@ import {
   formatCheckResults,
   formatUpgradeResults,
 } from "./commands/upgrade.js";
+import { ARTIFACT_TYPES } from "./types.js";
 import type { ArcManifest, ArtifactType, PackageTier, RegistrySource, SourceType } from "./types.js";
 import { login } from "./commands/login.js";
 import { logout } from "./commands/logout.js";
@@ -562,10 +563,13 @@ program
   .command("list")
   .description("List installed packages")
   .option("--json", "Output as JSON")
-  .option("--type <type>", "Filter by artifact type (skill, tool, agent, prompt, pipeline, rules, governance)")
+  .option("--type <type>", `Filter by artifact type (${ARTIFACT_TYPES.join(", ")})`)
   .option("--library <name>", "Filter by library name")
   .action((opts: { json?: boolean; type?: string; library?: string }) => {
-    const validTypes = ["skill", "system", "tool", "agent", "prompt", "component", "pipeline", "rules", "action", "governance"];
+    // Derived from the single source (arc#399 / D7.1). The hand-copied list this
+    // replaces had drifted: it rejected `--type library` and `--type process`
+    // for packages `arc list` will happily print.
+    const validTypes: readonly string[] = ARTIFACT_TYPES;
     if (opts.type && !validTypes.includes(opts.type)) {
       console.error(`\n❌ Unknown type "${opts.type}". Valid types: ${validTypes.join(", ")}`);
       process.exit(1);
@@ -1024,7 +1028,14 @@ program
       name: string | undefined,
       opts: { dir?: string; author?: string; type?: string }
     ) => {
-      const validTypes = ["skill", "tool", "agent", "prompt", "pipeline"] as const;
+      // NOT the type enum — a deliberate SUBSET of it: the types
+      // `init-scaffold.ts` knows how to lay out on disk. `library` has no
+      // single-artifact layout to scaffold, and the composition types
+      // (`bundle`/`factory`) have no payload to scaffold at all, so widening
+      // this to ARTIFACT_TYPES would offer scaffolds that do not exist.
+      // `satisfies` pins it as a subset: a value that is not an ArtifactType
+      // fails to compile (arc#399).
+      const validTypes = ["skill", "tool", "agent", "prompt", "pipeline"] as const satisfies readonly ArtifactType[];
       type ArtifactInitType = (typeof validTypes)[number];
 
       const artifactType: ArtifactInitType =

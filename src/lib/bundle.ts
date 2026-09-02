@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "fs/promises";
 import { tmpdir } from "os";
 import { existsSync } from "fs";
 import { readManifest } from "./manifest.js";
+import { ARTIFACT_TYPES } from "../types.js";
 import type { ArcManifest, BundleResult, PublishValidation } from "../types.js";
 
 export const README_VARIANTS = ["README.md", "readme.md", "Readme.md"];
@@ -98,10 +99,27 @@ export function getExclusionPatterns(manifest: ArcManifest): string[] {
 const VALID_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?$/;
 
-const VALID_TYPES = [
-  "skill", "tool", "agent", "prompt", "component",
-  "pipeline", "rules", "library", "action",
-];
+/**
+ * Package types `arc publish` accepts — DERIVED from the single source
+ * `ARTIFACT_TYPES` (src/types.ts) since arc#399, per
+ * `docs/design-factory-type.md` D7.1.
+ *
+ * This was the WORST of the three hand copies and the one that was actually
+ * broken (arc#397): it omitted `system`, `process` and `governance`, so those
+ * three types installed fine and then failed at `arc publish` with "type … is
+ * not a recognized artifact type" — a package arc could install but its author
+ * could not ship. Deriving fixes all three at once and makes the class of bug
+ * unrepeatable; test/unit/type-set-parity.test.ts is its regression test.
+ *
+ * Publishability policy note (D7.4): arc's publish gate accepts every type arc
+ * can install. Whether the REGISTRY accepts a given arc-only value
+ * (`system`/`component`/`pipeline`/`process`/`action`/`governance`) is a
+ * separate, deliberately deferred decision — see the mapping table on
+ * `ARTIFACT_TYPES`. arc does not pre-empt the registry's answer here; a
+ * registry-side rejection surfaces at the register step with the registry's own
+ * message, which is more truthful than arc guessing.
+ */
+const VALID_TYPES: readonly string[] = ARTIFACT_TYPES;
 
 /** Validate a manifest for publishing (stricter than install validation).
  * Accepts Partial because YAML may produce a structurally-incomplete object

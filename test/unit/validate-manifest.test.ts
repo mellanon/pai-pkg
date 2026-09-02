@@ -129,11 +129,17 @@ describe("type rule (arc#95: 'action' is valid)", () => {
   test("pass: type action (arc#95)", () => {
     expect(hasField(validateStrictManifest(withManifest({ type: "action" })), "type")).toBe(false);
   });
-  test("fail: type bundle rejected (arc#334, decision b — bundle is a repo-name class, not a manifest type)", () => {
-    expect(hasField(validateStrictManifest(withManifest({ type: "bundle" })), "type")).toBe(true);
+  test("pass: type bundle (arc#399 / D7.2 — the reference-composition MANIFEST type; arc#334's rejection is superseded now that planArtifactSymlinks has a case for it)", () => {
+    expect(hasField(validateStrictManifest(withManifest({ type: "bundle" })), "type")).toBe(false);
+  });
+  test("pass: type factory (arc#399 / D7.2)", () => {
+    expect(hasField(validateStrictManifest(withManifest({ type: "factory" })), "type")).toBe(false);
   });
   test("fail: unknown type", () => {
     expect(hasField(validateStrictManifest(withManifest({ type: "widget" })), "type")).toBe(true);
+  });
+  test("fail: governance-overlay is still out of the enum (design-factory-type.md E10)", () => {
+    expect(hasField(validateStrictManifest(withManifest({ type: "governance-overlay" })), "type")).toBe(true);
   });
 });
 
