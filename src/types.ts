@@ -17,6 +17,15 @@
 import type { ArtifactType } from "./artifact-types.js";
 export { ARTIFACT_TYPES, type ArtifactType } from "./artifact-types.js";
 
+/**
+ * The manifest `tier` vocabulary, defined in `lib/factory-references.ts`
+ * (arc#402) and used by `PublishValidation.computedTier` below. TYPE-ONLY
+ * import and re-export: both are erased at build, so that leaf module stays
+ * outside the cycle described above.
+ */
+import type { ManifestTier } from "./lib/factory-references.js";
+export type { ManifestTier } from "./lib/factory-references.js";
+
 // ── Registry types ────────────────────────────────────────────
 
 /**
@@ -1127,6 +1136,15 @@ export interface PublishValidation {
   warnings: string[];
   name: string;
   version: string;
+  /**
+   * D5's computed tier: the MIN of the composition's resolved member tiers, or
+   * null for a non-composition and for a composition whose members did not
+   * resolve. Surfaced (arc#402) so a caller can SHOW what the composition's
+   * tier actually computes to rather than trusting the declaration — without
+   * it, a factory that declares no tier passes D5 with nothing to display and
+   * the check reads as vacuous.
+   */
+  computedTier?: ManifestTier | null;
 }
 
 /** Result of R2 storage upload */

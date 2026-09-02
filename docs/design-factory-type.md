@@ -207,3 +207,140 @@ registry (#366 "stock the shelf" owns it) · creating the factory repo
 6. compass-core#20 (exists): plan-breakdown skill ships with its SOP.
 7. The factory repo itself: `metafactory-factory-software` (name
    ratified), manifest `name: software-factory`, MVP members per D8.
+
+---
+
+## Implementation record — arc#402 (publish side, D4 + D5)
+
+Additive. Records what slice 4 built and the one judgement call it had to
+make; it changes no ratified decision above.
+
+**Where it lives (post-#400 rebase).** `lib/composition.ts`
+`validateCompositionFields` is the single SHAPE authority for `references[]`,
+`tools[]` and `produces`, shared by `arc validate`, `arc install` and now
+`arc publish`. `src/lib/factory-references.ts` is a thin LAYER over it holding
+only what publish alone enforces; `validateForPublish` (`src/lib/bundle.ts`)
+calls that layer for EVERY type, and `createBundle` forwards the same options,
+so `arc bundle` and `arc publish` apply one gate rather than two.
+
+The publish-only rules, and why each is publish-only:
+
+| Rule | Why not shared |
+|---|---|
+| Members must RESOLVE | Publish freezes the snapshot forever; an unresolvable member is fatal here in a way it is not at authoring time. |
+| D5 tier arithmetic is an ERROR | Install re-checks tier and WARNs — a member's tier can change under an already-published factory, and refusing then would strand an operator over someone else's later act. Publish mints the claim, so publish refuses. |
+| `tools:`/`produces:` REQUIRED on a factory | #400 validates them only when present, because install must tolerate a manifest published before the field existed. The registry requires both. |
+| `references[]` must be non-empty | #400 leaves it optional so install tolerates a member-less manifest without crashing; publishing one puts an empty promise on the registry. |
+| `tools[]` ceiling of 20 | Mirrors the registry's absurdity ceiling. Install has no business refusing a manifest the registry accepted. |
+| Case-variant duplicate detection | The shared duplicate check compares names verbatim while the name grammar is case-INSENSITIVE, so `@metafactory/cortex` + `@MetaFactory/Cortex` slips through it as two members. |
+| Build-metadata explanation | The shared grammar already refuses it; publish adds the targeted reason. |
+
+Everything else arc#402 originally wrote — the pin regex, the reference-name
+grammar, tool/produces shape, field placement — was DELETED at the rebase as
+duplication of the shared validator.
+
+**Convergence (#400 ↔ #402).** Both slices derived the exact-pin grammar
+independently from the registry's storage regex and landed BYTE-IDENTICAL on
+`/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?$/`; `PRODUCES_RE` likewise (#400 adopted
+#402's verbatim). One of each survives, exported from `composition.ts`. Where
+the two differed, #400's shape won by the rule that the shared validator owns
+shape: a reference is a scoped-name string (`@scope/name`), not `{scope,
+name}`; a tool declares `version` + `reason`, not `min_version` +
+`justification`.
+
+**Divergences from the REGISTRY, recorded not absorbed.** Three, all created
+by #400's schema choices and all now visible from the publish side:
+
+1. `tools[].version` is a RANGE floor in arc (`>=2.30.0`, the `satisfiesRange`
+   grammar); the registry's `tools[].min_version` is an EXACT semver floor and
+   refuses ranges outright ("a range is not a floor"). Different field NAME and
+   different GRAMMAR. arc#402's first cut mirrored the registry and was
+   superseded.
+2. `produces` accepts a string OR an array of slugs in arc; the registry
+   accepts a single string only.
+3. `tools[].name` is case-INSENSITIVE in arc (a host binary, and mixed-case
+   binaries exist on real PATHs); the registry's is lowercase-only.
+
+Each means a manifest arc publishes could be refused by registry intake with a
+different vocabulary. Not resolvable arc-side alone — it needs a registry-side
+decision or an arc-side narrowing, and it is the open item for whoever wires
+composition publishing (#366 / meta-factory#573).
+
+**Grammar agreement with the registry.** The exact-pin grammar is not
+mirrored by hand, it IS the registry's storage grammar — meta-factory
+`src/lib/semver.ts`, `/^(\d+)\.(\d+)\.(\d+)(?:-([a-zA-Z0-9.]+))?$/`, read on
+2026-09-02 rather than assumed. A pin is exact when it names a version the
+registry can actually hold, so the registry's grammar is the definition;
+anything arc invents on top is a place the two gates can disagree.
+
+Two consequences, pointing in opposite directions, both deliberate:
+
+- Build metadata is refused BY CONSTRUCTION (the grammar has no `+` branch)
+  — the same S2 derivation meta-factory#574 made: the registry stores no
+  `1.2.3+build` version so such a pin can never resolve, and SemVer compares
+  `1.0.0+a` and `1.0.0+b` EQUAL so it is not a unique pin either. Both ends
+  refuse it with a TARGETED message rather than a generic "not exact",
+  because a build-metadata pin looks exact to its author.
+- Leading zeros (`1.02.3`) are ACCEPTED, against the official SemVer 2.0.0
+  grammar. The registry's per-component class is `\d+`, so `1.02.3` is a
+  version it can store and resolve; refusing it arc-side would invent a false
+  refusal against a legitimately published version and break the property
+  this mirror exists for. If the registry tightens, arc follows — that is the
+  direction the dependency runs.
+
+Reading the registry's source also closed a real gap in the other direction:
+arc's first cut allowed a hyphen inside the prerelease (`1.2.3-rc-1`), which
+the registry's `[a-zA-Z0-9.]+` cannot store. arc was accepting pins that
+could never resolve.
+
+arc's own manifest-VERSION grammar (bundle.ts, validate-manifest.ts) still
+accepts build metadata — a different question (what a version may look like)
+from this one (what a pin may resolve to). So is `tools[].version`, which is a
+HOST BINARY's version, which the registry never stores, and which #400 defines
+as a range floor (see the divergence list above).
+
+**Where member tiers come from at publish — the judgement call.** D5
+computes the factory's tier from its members, so the source of member tiers
+decides what the published tier MEANS. Decided: **the registry entry for the
+pinned version is the only authority; it is injected as a `MemberResolver`;
+and with no resolver available, publish REFUSES.**
+
+| Candidate | Verdict |
+|---|---|
+| Installed DB rows (`arc list`) | REJECTED — describes the publisher's laptop, not the release. A member may be installed at a version other than the pinned one, or from a local path at `tier: custom` while the published package is `official`. The factory's tier would then depend on who typed `arc publish`. |
+| Skip the check when members are unresolvable | REJECTED — publishes a factory whose declared tier was never checked against anything. D5 says trust never averages up; not computing it averages up by omission, silently. |
+| The registry, injected; refuse when absent | CHOSEN — the only source that describes the release rather than a machine. |
+
+Consequence, stated plainly: until a caller wires a registry-backed
+resolver, `arc publish` / `arc bundle` of a `factory` or `bundle` FAILS
+CLOSED with a message saying so. That matches the registry counterpart,
+which is itself fail-closed for composition publishing until meta-factory#573
+maps `manifest.references[]` onto the intake envelope — the two gates agree,
+including on what they cannot yet do. Live-registry publishing of a real
+factory is HELD under #366 regardless.
+
+**The tier vocabulary is a seam, and it is checked.** `ManifestTier` is
+erased at runtime, so the type annotation on a resolver's return value
+guarantees nothing about what a real (registry-JSON-parsing) resolver
+actually hands back. An unrecognized tier is REFUSED, naming the member and
+the value — not clamped. Clamping to `custom` would invent a trust level
+nobody declared, and clamping to the member's claim would trust the very
+string arc failed to recognize. The failure this closes: because `minTier`
+ranks by index, an unknown value scored -1 and dropped silently out of the
+MIN, so one bad member weakened D5 and ALL bad members disabled it outright
+while publish reported clean. A malformed DECLARED tier (`Official`) is
+refused for the same reason — it used to fall through the guard written for
+an absent one, which is the single typo that turns D5 off.
+
+**Revocation.** A resolved-but-revoked member WARNs at publish-refresh and
+does not refuse: the author may be publishing precisely to move off it. The
+harder question — what a revocation means for an ALREADY-published pin at
+install time (DD-108) — is recorded as #407 rather than decided silently
+here.
+
+**Not done here.** `PackageTier` (3 values) and the manifest tier vocabulary
+(4, with `core`) remain two enums — reconciling them has its own blast radius
+(`arc search --tier`, `sources.yaml`) and does not belong in a
+publish-validation slice. The three arc↔registry divergences listed above are
+recorded, not fixed. And no registry-backed `MemberResolver` is wired: the seam
+exists and fails closed without one, which is the honest state until #366.

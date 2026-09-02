@@ -4,6 +4,10 @@ import { tmpdir } from "os";
 import { existsSync } from "fs";
 import { readManifest } from "./manifest.js";
 import { ARTIFACT_TYPES } from "../types.js";
+import {
+  validateFactoryComposition,
+  type FactoryCompositionOptions,
+} from "./factory-references.js";
 import type { ArcManifest, BundleResult, PublishValidation } from "../types.js";
 
 export const README_VARIANTS = ["README.md", "readme.md", "Readme.md"];
@@ -123,8 +127,17 @@ const VALID_TYPES: readonly string[] = ARTIFACT_TYPES;
 
 /** Validate a manifest for publishing (stricter than install validation).
  * Accepts Partial because YAML may produce a structurally-incomplete object
- * even when the type pretends every field is present. */
-export function validateForPublish(manifest: Partial<ArcManifest>): PublishValidation {
+ * even when the type pretends every field is present.
+ *
+ * `options` carries the publish-time member resolver used by the composition
+ * rules (arc#402 / D4 / D5). It is optional so every existing caller keeps
+ * working unchanged; for a `factory` or `bundle` manifest its ABSENCE is
+ * itself a refusal — see `MemberResolver` in lib/factory-references.ts for the
+ * recorded reasoning. Non-composition types are unaffected either way. */
+export function validateForPublish(
+  manifest: Partial<ArcManifest>,
+  options: FactoryCompositionOptions = {},
+): PublishValidation {
   const errors: string[] = [];
   const warnings: string[] = [];
 
@@ -150,12 +163,20 @@ export function validateForPublish(manifest: Partial<ArcManifest>): PublishValid
     warnings.push("description is missing (recommended for registry listing)");
   }
 
+  // Composition rules (arc#402, docs/design-factory-type.md D1/D4/D5). Runs for
+  // EVERY type: half the contract is refusing a composition declaration on a
+  // type that will never read it.
+  const composition = validateFactoryComposition(manifest, options);
+  errors.push(...composition.errors);
+  warnings.push(...composition.warnings);
+
   return {
     valid: errors.length === 0,
     errors,
     warnings,
     name: manifest.name ?? "",
     version: manifest.version ?? "",
+    computedTier: composition.computedTier,
   };
 }
 
@@ -183,10 +204,16 @@ async function getBundleStats(tarballPath: string): Promise<{ sha256: string; si
 
 // ── Tarball creation ─────────────────────────────────────────
 
-/** Create a .tar.gz bundle from a package directory */
+/** Create a .tar.gz bundle from a package directory.
+ *
+ * `options` is forwarded verbatim to `validateForPublish` so a caller that can
+ * resolve composition members (arc#402) supplies the resolver here. A caller
+ * that cannot — `arc bundle`, which is deliberately offline — supplies nothing
+ * and a composition package is refused with a message saying exactly that. */
 export async function createBundle(
   packageDir: string,
   outputPath?: string,
+  options: FactoryCompositionOptions = {},
 ): Promise<BundleResult> {
   const warnings: string[] = [];
 
@@ -195,7 +222,7 @@ export async function createBundle(
     return { success: false, tarballPath: "", sha256: "", sizeBytes: 0, fileCount: 0, manifest: {} as ArcManifest, warnings: [], error: "No arc-manifest.yaml found in package directory" };
   }
 
-  const validation = validateForPublish(manifest);
+  const validation = validateForPublish(manifest, options);
   if (!validation.valid) {
     return { success: false, tarballPath: "", sha256: "", sizeBytes: 0, fileCount: 0, manifest, warnings: validation.warnings, error: `Manifest validation failed: ${validation.errors.join(", ")}` };
   }
