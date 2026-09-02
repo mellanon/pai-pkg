@@ -79,9 +79,25 @@ describe("arc#399 — bundle and factory are manifest types (D7.2)", () => {
     }
   });
 
-  test("both are accepted by publish validation", () => {
+  /**
+   * SUPERSEDED IN PART by arc#402. Slice 1 asserted a bare
+   * `{name, version, type: bundle}` was publish-VALID, because nothing yet knew
+   * what a composition owed. Slice 4 (D1/D4/D5) gives the composition types
+   * publish rules of their own — references required and exactly pinned, member
+   * resolution, tier = MIN — so that same bare manifest is now correctly
+   * refused for having no members.
+   *
+   * The invariant THIS file exists to protect is untouched, and is what is
+   * asserted here: the type is recognized. A refusal for missing `references`
+   * is the composition gate doing its job; a refusal for "not a recognized
+   * artifact type" would be the arc#397 regression.
+   * `test/unit/factory-publish.test.ts` owns the composition rules themselves.
+   */
+  test("both are recognized types at publish (composition rules are arc#402's)", () => {
     for (const type of ["bundle", "factory"] as const) {
-      expect(validateForPublish({ name: "p", version: "1.0.0", type }).valid).toBe(true);
+      const result = validateForPublish({ name: "p", version: "1.0.0", type });
+      expect(result.errors.some((e) => e.includes("not a recognized artifact type"))).toBe(false);
+      expect(result.errors.some((e) => e.includes("references"))).toBe(true);
     }
   });
 });

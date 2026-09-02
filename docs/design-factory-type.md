@@ -207,3 +207,61 @@ registry (#366 "stock the shelf" owns it) · creating the factory repo
 6. compass-core#20 (exists): plan-breakdown skill ships with its SOP.
 7. The factory repo itself: `metafactory-factory-software` (name
    ratified), manifest `name: software-factory`, MVP members per D8.
+
+---
+
+## Implementation record — arc#402 (publish side, D4 + D5)
+
+Additive. Records what slice 4 built and the one judgement call it had to
+make; it changes no ratified decision above.
+
+**Where it lives.** `src/lib/factory-references.ts` (a leaf module, zero
+runtime imports) holds the composition rules; `validateForPublish`
+(`src/lib/bundle.ts`) calls it for EVERY type, because half the contract is
+refusing a composition declaration on a type that will never read it.
+`createBundle` forwards the same options, so `arc bundle` and `arc publish`
+apply one gate rather than two.
+
+**Grammar agreement with the registry.** The exact-pin rule mirrors
+meta-factory#574 (`src/lib/factory-checks.ts`), including its refusal of
+SemVer build metadata: the registry stores no `1.2.3+build` version, so such
+a pin can never resolve, and SemVer compares `1.0.0+a` and `1.0.0+b` EQUAL,
+so it is not a unique pin either. Both ends refuse it with a targeted
+message rather than a generic "not exact", because a build-metadata pin
+LOOKS exact to its author. arc's own manifest-version grammar still accepts
+build metadata — a different question (what a version may look like) from
+this one (what a pin may resolve to).
+
+**Where member tiers come from at publish — the judgement call.** D5
+computes the factory's tier from its members, so the source of member tiers
+decides what the published tier MEANS. Decided: **the registry entry for the
+pinned version is the only authority; it is injected as a `MemberResolver`;
+and with no resolver available, publish REFUSES.**
+
+| Candidate | Verdict |
+|---|---|
+| Installed DB rows (`arc list`) | REJECTED — describes the publisher's laptop, not the release. A member may be installed at a version other than the pinned one, or from a local path at `tier: custom` while the published package is `official`. The factory's tier would then depend on who typed `arc publish`. |
+| Skip the check when members are unresolvable | REJECTED — publishes a factory whose declared tier was never checked against anything. D5 says trust never averages up; not computing it averages up by omission, silently. |
+| The registry, injected; refuse when absent | CHOSEN — the only source that describes the release rather than a machine. |
+
+Consequence, stated plainly: until a caller wires a registry-backed
+resolver, `arc publish` / `arc bundle` of a `factory` or `bundle` FAILS
+CLOSED with a message saying so. That matches the registry counterpart,
+which is itself fail-closed for composition publishing until meta-factory#573
+maps `manifest.references[]` onto the intake envelope — the two gates agree,
+including on what they cannot yet do. Live-registry publishing of a real
+factory is HELD under #366 regardless.
+
+**Revocation.** A resolved-but-revoked member WARNs at publish-refresh and
+does not refuse: the author may be publishing precisely to move off it. The
+harder question — what a revocation means for an ALREADY-published pin at
+install time (DD-108) — is recorded as #407 rather than decided silently
+here.
+
+**Not done here.** `references[]`, `tools:` and `produces:` are declared
+minimally on `ArcManifest` for publish's use; #400 owns the install-side
+schema for the same fields and converges on them. Strict `arc validate` is
+untouched. `PackageTier` (3 values) and the manifest tier vocabulary (4,
+with `core`) remain two enums — reconciling them has its own blast radius
+(`arc search --tier`, `sources.yaml`) and does not belong in a
+publish-validation slice.
