@@ -215,12 +215,56 @@ registry (#366 "stock the shelf" owns it) · creating the factory repo
 Additive. Records what slice 4 built and the one judgement call it had to
 make; it changes no ratified decision above.
 
-**Where it lives.** `src/lib/factory-references.ts` (a leaf module, zero
-runtime imports) holds the composition rules; `validateForPublish`
-(`src/lib/bundle.ts`) calls it for EVERY type, because half the contract is
-refusing a composition declaration on a type that will never read it.
-`createBundle` forwards the same options, so `arc bundle` and `arc publish`
-apply one gate rather than two.
+**Where it lives (post-#400 rebase).** `lib/composition.ts`
+`validateCompositionFields` is the single SHAPE authority for `references[]`,
+`tools[]` and `produces`, shared by `arc validate`, `arc install` and now
+`arc publish`. `src/lib/factory-references.ts` is a thin LAYER over it holding
+only what publish alone enforces; `validateForPublish` (`src/lib/bundle.ts`)
+calls that layer for EVERY type, and `createBundle` forwards the same options,
+so `arc bundle` and `arc publish` apply one gate rather than two.
+
+The publish-only rules, and why each is publish-only:
+
+| Rule | Why not shared |
+|---|---|
+| Members must RESOLVE | Publish freezes the snapshot forever; an unresolvable member is fatal here in a way it is not at authoring time. |
+| D5 tier arithmetic is an ERROR | Install re-checks tier and WARNs — a member's tier can change under an already-published factory, and refusing then would strand an operator over someone else's later act. Publish mints the claim, so publish refuses. |
+| `tools:`/`produces:` REQUIRED on a factory | #400 validates them only when present, because install must tolerate a manifest published before the field existed. The registry requires both. |
+| `references[]` must be non-empty | #400 leaves it optional so install tolerates a member-less manifest without crashing; publishing one puts an empty promise on the registry. |
+| `tools[]` ceiling of 20 | Mirrors the registry's absurdity ceiling. Install has no business refusing a manifest the registry accepted. |
+| Case-variant duplicate detection | The shared duplicate check compares names verbatim while the name grammar is case-INSENSITIVE, so `@metafactory/cortex` + `@MetaFactory/Cortex` slips through it as two members. |
+| Build-metadata explanation | The shared grammar already refuses it; publish adds the targeted reason. |
+
+Everything else arc#402 originally wrote — the pin regex, the reference-name
+grammar, tool/produces shape, field placement — was DELETED at the rebase as
+duplication of the shared validator.
+
+**Convergence (#400 ↔ #402).** Both slices derived the exact-pin grammar
+independently from the registry's storage regex and landed BYTE-IDENTICAL on
+`/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?$/`; `PRODUCES_RE` likewise (#400 adopted
+#402's verbatim). One of each survives, exported from `composition.ts`. Where
+the two differed, #400's shape won by the rule that the shared validator owns
+shape: a reference is a scoped-name string (`@scope/name`), not `{scope,
+name}`; a tool declares `version` + `reason`, not `min_version` +
+`justification`.
+
+**Divergences from the REGISTRY, recorded not absorbed.** Three, all created
+by #400's schema choices and all now visible from the publish side:
+
+1. `tools[].version` is a RANGE floor in arc (`>=2.30.0`, the `satisfiesRange`
+   grammar); the registry's `tools[].min_version` is an EXACT semver floor and
+   refuses ranges outright ("a range is not a floor"). Different field NAME and
+   different GRAMMAR. arc#402's first cut mirrored the registry and was
+   superseded.
+2. `produces` accepts a string OR an array of slugs in arc; the registry
+   accepts a single string only.
+3. `tools[].name` is case-INSENSITIVE in arc (a host binary, and mixed-case
+   binaries exist on real PATHs); the registry's is lowercase-only.
+
+Each means a manifest arc publishes could be refused by registry intake with a
+different vocabulary. Not resolvable arc-side alone — it needs a registry-side
+decision or an arc-side narrowing, and it is the open item for whoever wires
+composition publishing (#366 / meta-factory#573).
 
 **Grammar agreement with the registry.** The exact-pin grammar is not
 mirrored by hand, it IS the registry's storage grammar — meta-factory
@@ -251,9 +295,9 @@ could never resolve.
 
 arc's own manifest-VERSION grammar (bundle.ts, validate-manifest.ts) still
 accepts build metadata — a different question (what a version may look like)
-from this one (what a pin may resolve to). So is `tools[].min_version`,
-which is a HOST BINARY's version and which the registry never stores; it
-keeps the looser grammar on purpose.
+from this one (what a pin may resolve to). So is `tools[].version`, which is a
+HOST BINARY's version, which the registry never stores, and which #400 defines
+as a range floor (see the divergence list above).
 
 **Where member tiers come from at publish — the judgement call.** D5
 computes the factory's tier from its members, so the source of member tiers
@@ -294,10 +338,9 @@ harder question — what a revocation means for an ALREADY-published pin at
 install time (DD-108) — is recorded as #407 rather than decided silently
 here.
 
-**Not done here.** `references[]`, `tools:` and `produces:` are declared
-minimally on `ArcManifest` for publish's use; #400 owns the install-side
-schema for the same fields and converges on them. Strict `arc validate` is
-untouched. `PackageTier` (3 values) and the manifest tier vocabulary (4,
-with `core`) remain two enums — reconciling them has its own blast radius
+**Not done here.** `PackageTier` (3 values) and the manifest tier vocabulary
+(4, with `core`) remain two enums — reconciling them has its own blast radius
 (`arc search --tier`, `sources.yaml`) and does not belong in a
-publish-validation slice.
+publish-validation slice. The three arc↔registry divergences listed above are
+recorded, not fixed. And no registry-backed `MemberResolver` is wired: the seam
+exists and fails closed without one, which is the honest state until #366.
