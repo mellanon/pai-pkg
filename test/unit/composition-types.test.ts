@@ -118,26 +118,34 @@ describe("arc#399 — the two gates agree on a minimal composition manifest (D2)
       expect(violations).toEqual([]);
     });
 
-    test(`type: ${type} that DOES declare capabilities is still validated in full`, () => {
-      // The exemption is about PRESENCE only. An author who makes the claim is
-      // held to the arc#240 schema exactly like any other type — here the
-      // rejected legacy `{ domain, reason }` network shape (arc#335).
+    test(`type: ${type} that DOES declare capabilities is REFUSED (superseded by arc#400 S2)`, () => {
+      // arc#399 held that the exemption covered PRESENCE only, so a composition
+      // that declared a block was validated in full like any other type.
+      // arc#400's review took the same doctrine one step further and made the
+      // declaration itself an error: a composition ships no code, so a declared
+      // block creates two answers to "what can this do" — the one an operator
+      // reads in the repo, and the computed union that actually governs. The
+      // refusal deletes the gap, and matches the registry's own gate
+      // (meta-factory PR #574 §8). Note the block below is WELL-FORMED and is
+      // refused anyway: the objection is to its existence, not its shape.
       const violations = validateStrictManifest({
         manifest: {
           ...strictCompositionManifest(type),
           capabilities: {
             filesystem: { read: [], write: [] },
-            network: [{ domain: "api.example.com", reason: "legacy shape" }],
+            network: [{ host: "api.example.com", reason: "well-formed, still refused" }],
             bash: { allowed: false },
             secrets: [],
           },
         },
         repoDirName: "metafactory-bundle-software-factory",
       });
-      expect(violations.some((v) => v.field.startsWith("capabilities.network"))).toBe(true);
+      const hit = violations.find((v) => v.field === "capabilities");
+      expect(hit).toBeDefined();
+      expect(hit!.rule.toLowerCase()).toContain("union");
     });
 
-    test(`type: ${type} with a malformed capabilities block is rejected, not exempted`, () => {
+    test(`type: ${type} with a malformed capabilities block is rejected too`, () => {
       const violations = validateStrictManifest({
         manifest: { ...strictCompositionManifest(type), capabilities: "none" },
         repoDirName: "metafactory-bundle-software-factory",

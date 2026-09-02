@@ -140,6 +140,46 @@ export interface PackageDependency {
   version?: string;
 }
 
+/**
+ * One entry of a composition's `references[]` — a MEMBER of a `bundle` /
+ * `factory` (arc#400, `docs/design-factory-type.md` D2/D4).
+ *
+ * `version` is EXACT, never a range: a factory release is a reproducible
+ * snapshot, so `arc install <factory>@1.2.0` resolves identically forever. The
+ * refusal lives in `lib/composition.ts` (`validateCompositionFields`) and fires
+ * at install as well as at publish.
+ *
+ * Two addressing forms, matching arc's two existing install sources:
+ *   - `name: "@scope/name"` — a published registry package (the default).
+ *   - `name` + `repo:` — a git URL checked out at the tag for `version`, the
+ *     escape hatch for a member that is not (yet) on the registry.
+ *
+ * Distinct from {@link PackageDependency}: a dependency is something a package
+ * NEEDS alongside it; a reference is what the composition IS made of, and its
+ * capability surface is part of the composition's own combined review.
+ */
+export interface PackageReference {
+  name: string;
+  version: string;
+  repo?: string;
+}
+
+/**
+ * One entry of a factory's `tools:` — a HOST BINARY the composition requires
+ * (arc#400 / D1, D8).
+ *
+ * Distinct from {@link ToolDependency} (`depends_on.tools`), which arc
+ * deliberately surfaces without verifying: a factory's `tools:` is a
+ * precondition for the composition working at all, so it IS verified — before
+ * any reference is resolved — and a missing binary refuses the install by name.
+ */
+export interface ToolRequirement {
+  name: string;
+  /** Optional version floor in the `satisfiesRange` grammar (">=2.30.0"). */
+  version?: string;
+  reason?: string;
+}
+
 /** CLI tool provided by a skill */
 export interface CliProvider {
   command: string;
@@ -437,6 +477,32 @@ export interface ArcManifest {
   type: ArtifactType;
   /** Only present when type is "library" — lists contained artifacts */
   artifacts?: LibraryArtifactEntry[];
+  /**
+   * The composition's MEMBERS — `type: bundle` / `type: factory` only
+   * (arc#400, `docs/design-factory-type.md` D2/D4). A reference-composition
+   * ships no payload of its own; these name the published packages it is made
+   * of, each at an EXACT version (a range is refused at install AND at publish
+   * — a factory release is a reproducible snapshot).
+   *
+   * Resolved at install by `lib/composition.ts`, which reads each member's
+   * manifest BEFORE anything lands so the combined capability review (D2) can
+   * be computed and one confirmation asked. See `PackageReference`.
+   */
+  references?: PackageReference[];
+  /**
+   * HOST BINARIES the composition requires — `type: factory` only (D1).
+   *
+   * Distinct from `depends_on.tools`, which arc surfaces but does not verify:
+   * a factory's `tools:` is a precondition, checked at install BEFORE any
+   * reference is resolved, and a missing binary is a refusal naming it.
+   */
+  tools?: ToolRequirement[];
+  /**
+   * The capability the composition exists to provide — `type: factory` only
+   * (D1/D8, e.g. `produces: software`). Forwarded to the registry's discovery
+   * surface; arc itself only validates its shape.
+   */
+  produces?: string | string[];
   /**
    * Only present when type is "process" — the packaged pulse process
    * definition (DD-47 D/A/H taxonomy, dev-loop F-6d). See ProcessSpec.

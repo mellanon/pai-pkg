@@ -19,6 +19,7 @@
 import { ARTIFACT_TYPES } from "../types.js";
 import { toStrictName } from "./repo-name.js";
 import { validateOwns } from "./owns.js";
+import { validateCompositionFields } from "./composition.js";
 
 /** One rule failure. The CLI renders it as `<field>: <rule>` on its own line. */
 export interface Violation {
@@ -161,6 +162,14 @@ export function validateStrictManifest(input: StrictValidationInput): Violation[
   validateCapabilities(manifest, add);
   validateNamespace(manifest, add);
   validateSkillFrontmatterName(input.skillFrontmatterName, derivedName, manifest, add);
+  // references[]/tools[]/produces: the composition declarations (arc#400,
+  // docs/design-factory-type.md D1/D4). Same shared-validator posture as
+  // `owns` below — `arc validate` and `arc install` call the SAME pure
+  // function, so the publish gate and the install gate can never drift into
+  // disagreeing about the same manifest (the exact failure arc#399 closed for
+  // the type enum). D4's exact-pin rule is enforced from both ends by
+  // construction rather than by a second hand-written copy of the rule.
+  for (const v of validateCompositionFields(manifest)) add(v.field, v.rule);
   // owns: shared shape/safety gate (arc#359). Reuses the same pure validator the
   // lenient loader throws on, so `arc validate` and install agree byte-for-byte.
   for (const v of validateOwns(manifest.owns)) add(v.field, v.rule);
@@ -291,7 +300,7 @@ function validateAuthor(manifest: Record<string, unknown>, add: Add): void {
 }
 
 /**
- * The types exempt from the arc#240 capabilities-PRESENCE rule — the
+ * The types the arc#240 capabilities rule does not reach — the
  * reference-composition types (arc#399, `docs/design-factory-type.md` D1/D2).
  *
  * Note how narrow this is. Strict mode deliberately does NOT copy the lenient
@@ -300,7 +309,7 @@ function validateAuthor(manifest: Record<string, unknown>, add: Add): void {
  * rule that stops them omitting it. Only the compositions are listed, and only
  * because they genuinely have no own-surface to declare.
  */
-const CAPABILITIES_OPTIONAL_TYPES: readonly string[] = ["bundle", "factory"];
+const COMPOSITION_TYPES_HERE: readonly string[] = ["bundle", "factory"];
 
 /**
  * Validate the REQUIRED `capabilities` block (spec §4.1, arc#240). The block
@@ -309,30 +318,32 @@ const CAPABILITIES_OPTIONAL_TYPES: readonly string[] = ["bundle", "factory"];
  * Network entries use the standardized `{ host, reason }` shape ONLY: the
  * string shorthand and the legacy `{ domain, reason }` shape are both rejected.
  *
- * ## Composition exemption (arc#399, D2)
+ * ## Compositions are handled elsewhere, entirely (arc#399 → arc#400 S2)
  *
- * `bundle` and `factory` may omit the block entirely. arc#240's rationale is
- * that a package must never let its OWN capability surface default silently to
- * `low` — and a composition has no own surface: it ships no code, only a
- * manifest whose `references[]` name other published packages. Its real surface
- * is the UNION of its members', computed at install from the resolved
- * references and presented as one combined review (D2). Demanding explicit
- * empties here would make a factory ASSERT it is capability-free, which is a
- * stronger and more misleading claim than saying nothing — the opposite of what
- * arc#240 protects. It also keeps `arc validate` and `arc install` agreeing on a
- * minimal composition manifest, instead of the validator rejecting exactly what
- * the loader accepts.
+ * `bundle` and `factory` are skipped here in BOTH directions, present or
+ * absent. arc#240's rationale is that a package must never let its OWN
+ * capability surface default silently to `low` — and a composition has no own
+ * surface: it ships no code, only a manifest whose `references[]` name other
+ * published packages. Its real surface is the UNION of its members', computed
+ * at install and presented as one combined review (D2). Demanding explicit
+ * empties would make a factory ASSERT it is capability-free, a stronger and
+ * more misleading claim than saying nothing.
  *
- * The exemption covers PRESENCE only. A composition that DOES declare a
- * `capabilities:` block has it validated in full, exactly like any other type —
- * an author who makes the claim is held to the schema.
+ * arc#399 stopped at making the block optional; arc#400's review made declaring
+ * one an ERROR, on the same reasoning — two answers to "what can this do" is
+ * worse than one. That refusal is `validateCompositionFields`
+ * (lib/composition.ts), which `validateStrictManifest` also calls and which
+ * `arc install` calls too, so the rule has ONE owner and one wording. This
+ * function therefore steps aside for compositions rather than adding a second
+ * opinion that would fire alongside it.
  */
 function validateCapabilities(manifest: Record<string, unknown>, add: Add): void {
+  if (typeof manifest.type === "string" && COMPOSITION_TYPES_HERE.includes(manifest.type)) {
+    return;
+  }
+
   const caps = manifest.capabilities;
   if (caps === undefined || caps === null) {
-    if (typeof manifest.type === "string" && CAPABILITIES_OPTIONAL_TYPES.includes(manifest.type)) {
-      return;
-    }
     add(
       "capabilities",
       "is a required block with explicit empties (filesystem/network/bash/secrets) — never omitted (arc#240)",

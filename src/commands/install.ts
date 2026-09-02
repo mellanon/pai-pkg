@@ -1,7 +1,7 @@
 import { join } from "path";
 import { tmpdir } from "os";
 import { existsSync } from "fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rename, rm } from "node:fs/promises";
 import type {
   ArcPaths,
   ArcManifest,
@@ -86,6 +86,33 @@ import {
 // transaction (which runs postinstall), non-adjacent to F-6b's identity hook
 // and F-6e's secrets hook. Concern: cortex config merge only.
 import { maybeMergeCortexConfig } from "../lib/cortex-config-provision.js";
+// arc#400 (docs/design-factory-type.md D2/D4/D5) — REFERENCE-COMPOSITION
+// install. The trust logic (validation, the tools gate, D2 aggregation, the
+// combined review, D5's tier MIN) lives in lib/composition.ts, which owns no
+// git, no network and no database so every refusal is assertable without any
+// of the three. This file supplies the seams it needs: the host-binary probe,
+// the reference resolver (registry or repo), the confirmation channel, and the
+// member installer — the last of which is `install()` itself, which is exactly
+// why composition.ts must not import it back.
+import {
+  type CompositionPlan,
+  type CompositionSeams,
+  type PackageReference,
+  type ReferenceResolver,
+  type ResolvedCompositionMember,
+  type ToolProbe,
+  compositionRecordFor,
+  installCompositionMembers,
+  isCompositionType,
+  prepareComposition,
+} from "../lib/composition.js";
+import {
+  beginComposition,
+  completeComposition,
+  markCompositionMemberLanded,
+} from "../lib/db.js";
+import { loadSources } from "../lib/sources.js";
+import { fetchAndVerifyRegistryPackage, parsePackageRef } from "../lib/registry-install.js";
 
 export interface InstallOptions {
   /** arc's own state paths (configRoot, dbPath, reposDir, …). Host-independent. */
@@ -194,6 +221,21 @@ export interface InstallOptions {
    * env only tells the postinstall scripts which stack to reload/issue against.
    */
   cortexConfigEnv?: Record<string, string>;
+  /**
+   * arc#400 — reference-composition seams (`type: bundle` / `type: factory`).
+   *
+   * Production leaves this absent: `defaultCompositionSeams()` supplies a real
+   * host-binary probe, a registry/git reference resolver, the stdin
+   * confirmation, and `install()` itself as the member installer. Tests inject
+   * replacements so every refusal on the trust path — a range pin, a missing
+   * tool, a member manifest that fails validation, a declined review — is
+   * provable WITHOUT a network, a registry, or a real clone, and so "no member
+   * landed" can be asserted by counting installer calls rather than trusted.
+   *
+   * Individually optional: a test that only needs a stub probe leaves the rest
+   * to the defaults.
+   */
+  composition?: CompositionSeams;
 }
 
 export interface InstallResult {
@@ -615,6 +657,44 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
     return { success: false, error: brokerGate.error };
   }
 
+  // 2a''. COMPOSITION GATE (arc#400, docs/design-factory-type.md D2/D4/D5).
+  //
+  // For `type: bundle` / `type: factory`, everything that can REFUSE runs here,
+  // before a single member lands: the manifest's composition declarations are
+  // validated (a range pin is a loud error — D4, at install and not only at
+  // publish), the declared `tools:` are checked against the host, every
+  // reference is resolved and every member manifest read, the combined
+  // capability surface is computed (D2), the tier MIN is re-checked (D5), and
+  // ONE confirmation is asked.
+  //
+  // Placed BEFORE step 2b and before the factory's own landing on purpose: on
+  // any refusal below, this function returns having installed nothing at all —
+  // not the members, not the composition. That is D2's honesty rule, and it is
+  // only reachable because resolution and installation are separate phases.
+  let compositionPlan: CompositionPlan | undefined;
+  if (isCompositionType(manifest.type)) {
+    // Self-heal any `.compose-*` scratch left by a previous crashed run before
+    // staging anything new (W3).
+    await sweepOrphanedStagingDirs(arc.reposDir);
+
+    const prepared = await prepareComposition({
+      manifest,
+      seams: defaultCompositionSeams(opts),
+      yes: opts.yes,
+    });
+    if (!prepared.ok) {
+      // W3: staged bytes never outlive the refusal that rejected them.
+      await sweepStagedMembers(prepared.staged);
+      if (!opts.preExtractedPath) {
+        await rm(installPath, { recursive: true, force: true }).catch(() => {
+          /* best-effort; the refusal is the error worth surfacing */
+        });
+      }
+      return { success: false, error: prepared.error };
+    }
+    compositionPlan = prepared.plan;
+  }
+
   // 2b. Install package dependencies (other arc packages).
   // Extracted to installPackageDependencies() so the SAME loop runs on both
   // the fresh-install path (here) and the upgrade path (upgradePackage) —
@@ -666,11 +746,63 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
     }
   }
 
+  // 2b'. Install the composition's MEMBERS (arc#400 D2).
+  //
+  // Every refusal has already had its chance in the 2a'' gate, and the operator
+  // has approved the combined surface exactly once. A failure here is a member
+  // failing at RUNTIME (a postinstall exiting non-zero, a broker that vanished)
+  // — not a trust decision — so it propagates the same way a failed
+  // `depends_on.packages` dependency does: loud, naming the member, with the
+  // members that already landed left for `arc remove` to take down. Unwinding a
+  // partially-installed composition is the lifecycle slice's job (arc#401, D6).
+  if (compositionPlan?.members.length) {
+    const seams = defaultCompositionSeams(opts);
+
+    // F3: OPEN the composition record before the first member lands. From here
+    // an interruption — a kill, a member failing at runtime — is visible as an
+    // incomplete composition rather than as anonymous member packages and no
+    // trace of the factory. See the `compositions` schema comment in db.ts.
+    beginComposition(
+      db,
+      manifest.name,
+      manifest.version,
+      compositionRecordFor(compositionPlan),
+    );
+
+    const membersResult = await installCompositionMembers(compositionPlan, seams.installMember, {
+      yes: opts.yes,
+      log: seams.log,
+      warn: seams.warn,
+      // F2: the surface arc RECORDS for a landed member, checked against the
+      // surface the operator approved. Bound here because composition.ts owns
+      // no database, deliberately.
+      recordedRowsFor: (name) => recordedCapabilityRows(db, name),
+      reviewedRowsFor: (member) => capabilityRows(member.manifest),
+      onMemberLanded: (member) => {
+        markCompositionMemberLanded(db, manifest.name, member.reference.name);
+      },
+    });
+    if (!membersResult.success) {
+      // The record stays `pending`, naming exactly which members landed — that
+      // IS the report. Staged bytes for members that never landed are swept.
+      await sweepStagedMembers(
+        compositionPlan.members.filter((m) => !membersResult.landed.includes(m.reference.name)),
+      );
+      return { success: false, error: membersResult.error };
+    }
+  }
+
   // 3. Display capabilities
   const risk = assessRisk(manifest);
   const capLines = formatCapabilities(manifest);
 
-  if (!opts.yes) {
+  // A composition whose combined review already ran does NOT get a second,
+  // narrower capability display: the composition's own manifest declares no
+  // surface (that is the whole point of the arc#399 presence exemption), so
+  // printing an empty "Capabilities:" block under it would read as "this
+  // installs nothing" moments after the operator approved the union. The
+  // combined review IS this package's capability display.
+  if (!opts.yes && !compositionPlan?.reviewed) {
     const tier = opts.sourceTier ?? manifest.tier ?? "custom";
 
     if (tier === "custom" || !opts.sourceName) {
@@ -855,6 +987,21 @@ export async function install(opts: InstallOptions): Promise<InstallResult> {
       });
     }
     return transactionResult;
+  }
+
+  // arc#400 — RECORD THE COMPOSITION. Runs immediately after the transaction
+  // commits, because that commit is what creates the `skills` row this
+  // membership hangs off (FK, ON DELETE CASCADE): recording earlier would
+  // violate the constraint, and recording later risks a step in between
+  // returning first and leaving a composition installed but unrecorded.
+  //
+  // Written for arc#401 to consume — see the `composition_members` schema
+  // comment in lib/db.ts. The membership itself was written by
+  // `beginComposition` before the members landed (F3); this is the CLOSE that
+  // flips the record from `pending` to `complete`, and it is the only thing
+  // that distinguishes a finished composition from an interrupted one.
+  if (compositionPlan?.members.length) {
+    completeComposition(db, manifest.name);
   }
 
   // F-6b (arc#228) — IDENTITY STEP. For type:agent packages, provision the
@@ -1855,6 +2002,379 @@ async function readManifestAtRef(
       /* scratch dir; best-effort */
     });
   }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// arc#400 — the composition seams (docs/design-factory-type.md D2/D4)
+// ───────────────────────────────────────────────────────────────────────────
+
+/** First semver-shaped token in a `--version` banner, or undefined. */
+function parseToolVersion(output: string): string | undefined {
+  return /(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/.exec(output)?.[1];
+}
+
+/**
+ * The real host-binary probe behind a factory's `tools:` gate.
+ *
+ * Presence is `Bun.which` — the same PATH the postinstall scripts will see.
+ * The version is read by running `<binary> --version`, best-effort: a binary
+ * that has no `--version`, prints to stderr, or times out yields no version,
+ * and `checkTools` then WARNs rather than refusing (its documented fail-open
+ * split). The 5s timeout exists because `tools:` names third-party binaries
+ * and an install must not hang on one that waits for input.
+ */
+export function defaultToolProbe(name: string): ReturnType<ToolProbe> {
+  const path = Bun.which(name);
+  if (!path) return { found: false };
+
+  try {
+    const probe = Bun.spawnSync([path, "--version"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 5_000,
+    });
+    const output = `${probe.stdout.toString()}\n${probe.stderr.toString()}`;
+    return { found: true, path, version: parseToolVersion(output) };
+  } catch {
+    return { found: true, path };
+  }
+}
+
+/**
+ * Resolve one `references[]` entry to a staged member — WITHOUT landing it.
+ *
+ * Two paths, matching arc's two existing install sources:
+ *
+ *   - REGISTRY (`@scope/name`): the full verified pipeline
+ *     (`fetchAndVerifyRegistryPackage` — resolve, download, SHA-256, registry
+ *     signature, Sigstore, extract). The extracted dir is carried on the
+ *     resolved member as `preExtractedPath`, so the member installer hands the
+ *     SAME verified bytes to `install()` rather than downloading them twice.
+ *     A member is therefore verified exactly once, before the operator is asked
+ *     anything — which is what makes "abort before any member lands" affordable.
+ *
+ *   - REPO (`repo:` URL): a SHALLOW clone at the tag for the pinned version,
+ *     into a scratch dir outside `reposDir`, purely to read the manifest. The
+ *     scratch dir is removed before returning; the member installer then does
+ *     the ordinary `install({ repoUrl, pinnedRef })`, so a repo member goes
+ *     through the identical clone/checkout/validate path a hand-typed
+ *     `arc install <url> --pin <v>` takes. Yes, that clones twice; it buys the
+ *     honesty rule (nothing lands until every member has validated) without
+ *     duplicating install()'s clone semantics here. See the residual-risk note
+ *     on arc#400.
+ *
+ * `pinRefCandidates` gives the tag candidates (`v1.2.0` then `1.2.0`), the same
+ * grammar `--pin` uses, so a factory pin and a hand-typed pin resolve alike.
+ */
+export function createReferenceResolver(ctx: {
+  arc: ArcPaths;
+}): ReferenceResolver {
+  return async (reference: PackageReference) => {
+    return reference.repo
+      ? resolveRepoReference(reference, reference.repo)
+      : resolveRegistryReference(reference, ctx.arc);
+  };
+}
+
+async function resolveRegistryReference(
+  reference: PackageReference,
+  arc: ArcPaths,
+): Promise<{ ok: true; member: ResolvedCompositionMember } | { ok: false; error: string }> {
+  const ref = parsePackageRef(`${reference.name}@${reference.version}`);
+  if (!ref) {
+    return {
+      ok: false,
+      error: `'${reference.name}' is not a resolvable registry reference (expected '@scope/name') and declares no 'repo:' URL.`,
+    };
+  }
+
+  const sources = await loadSources(arc.sourcesPath);
+  // A scratch name under reposDir — the same convention the upgrade path uses
+  // for a verified re-download it has not committed to yet.
+  const targetDirName = `.compose-${ref.scope}__${ref.name}@${reference.version}`;
+  const fetched = await fetchAndVerifyRegistryPackage({
+    ref,
+    sources: sources.sources,
+    reposDir: arc.reposDir,
+    targetDirName,
+  });
+  if (!fetched.success || !fetched.extractedPath) {
+    return { ok: false, error: fetched.error ?? "registry fetch failed" };
+  }
+
+  let manifest: ArcManifest | null;
+  try {
+    manifest = await readManifest(fetched.extractedPath);
+  } catch (err) {
+    await rm(fetched.extractedPath, { recursive: true, force: true }).catch(() => undefined);
+    return { ok: false, error: `manifest is invalid: ${errorMessage(err)}` };
+  }
+  if (!manifest) {
+    await rm(fetched.extractedPath, { recursive: true, force: true }).catch(() => undefined);
+    return { ok: false, error: "package contains no arc-manifest.yaml" };
+  }
+
+  return {
+    ok: true,
+    member: {
+      reference,
+      manifest,
+      source: "registry",
+      ref: `@${ref.scope}/${ref.name}`,
+      preExtractedPath: fetched.extractedPath,
+    },
+  };
+}
+
+/**
+ * Resolve a `repo:` member: shallow-clone at the tag for the pinned version,
+ * read its manifest, and pin the member install to the resolved COMMIT.
+ *
+ * ## Why the pin is a SHA, not the tag (arc#400 review, F2)
+ *
+ * A tag is a mutable label. Consent is read here, from a scratch clone; the
+ * member then lands from a SECOND, independent clone. Handing that second clone
+ * the tag NAME reopens the window between them: `git tag -f v1.0.0` in between
+ * and the operator approves one commit while a different one installs. The
+ * version-equality check does not close it — that compares a number in a
+ * manifest, and the attacker controls the manifest too.
+ *
+ * So the candidate tag is used only to FIND the commit; what travels onward is
+ * `git rev-parse HEAD`, and consent is bound to the bytes rather than to the
+ * label that happened to point at them. `install()` resolves and checks out
+ * commit SHAs robustly (arc#396/#403), so this costs nothing but the extra
+ * `rev-parse`. `installCompositionMembers` then verifies the landed surface
+ * against the reviewed one as a second, route-independent check.
+ *
+ * Exported for the moved-tag regression test, which runs this real resolver and
+ * moves the tag between resolution and landing.
+ */
+export async function resolveRepoReference(
+  reference: PackageReference,
+  repoUrl: string,
+): Promise<{ ok: true; member: ResolvedCompositionMember } | { ok: false; error: string }> {
+  const candidates = pinRefCandidates(reference.version);
+  const scratch = await mkdtemp(join(tmpdir(), "arc-compose-"));
+  const checkout = join(scratch, "pkg");
+
+  try {
+    let cloned = false;
+    let lastError = "";
+    for (const candidate of candidates) {
+      const result = Bun.spawnSync(
+        ["git", "clone", "--depth", "1", "--branch", candidate, repoUrl, checkout],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      if (result.exitCode === 0) {
+        cloned = true;
+        break;
+      }
+      lastError = result.stderr.toString().trim();
+      await rm(checkout, { recursive: true, force: true }).catch(() => undefined);
+    }
+
+    if (!cloned) {
+      return {
+        ok: false,
+        error:
+          `no tag for the pinned version ${reference.version} in ${repoUrl} ` +
+          `(tried ${candidates.join(", ")}) — a factory member must be reachable at its exact pin (D4). ${lastError}`,
+      };
+    }
+
+    // The commit the review is about. From here the tag is irrelevant.
+    const revParse = Bun.spawnSync(["git", "rev-parse", "HEAD"], {
+      cwd: checkout,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (revParse.exitCode !== 0) {
+      return {
+        ok: false,
+        error: `could not resolve a commit for ${reference.version} in ${repoUrl}: ${revParse.stderr.toString().trim()}`,
+      };
+    }
+    const pinnedRef = revParse.stdout.toString().trim();
+
+    let manifest: ArcManifest | null;
+    try {
+      manifest = await readManifest(checkout);
+    } catch (err) {
+      return { ok: false, error: `manifest is invalid: ${errorMessage(err)}` };
+    }
+    if (!manifest) {
+      return { ok: false, error: `no arc-manifest.yaml at ${repoUrl}` };
+    }
+
+    return {
+      ok: true,
+      member: { reference, manifest, source: "repo", ref: repoUrl, pinnedRef },
+    };
+  } finally {
+    // Staging is not landing: the scratch checkout exists only so the member's
+    // manifest can be validated before the operator is asked anything, and it
+    // never outlives this call.
+    await rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/** The scratch prefix every staged composition member is extracted under. */
+const COMPOSE_STAGING_PREFIX = ".compose-";
+
+/**
+ * Delete the staged directories a set of resolved members is holding
+ * (arc#400 review, W3).
+ *
+ * Staging places bytes but nothing else — no symlink, no DB row, no host drop —
+ * so a refusal after staging still satisfies the honesty rule. It does leave
+ * the bytes, though, and bytes a refusal leaves behind are the next run's
+ * confusing state. Best-effort: a sweep failure must never mask the refusal
+ * that caused it.
+ */
+async function sweepStagedMembers(members: readonly ResolvedCompositionMember[]): Promise<void> {
+  for (const member of members) {
+    if (!member.preExtractedPath) continue;
+    await rm(member.preExtractedPath, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Remove `.compose-*` leftovers in `reposDir` before staging anything new.
+ *
+ * `sweepStagedMembers` handles every refusal arc controls; this handles the one
+ * it does not — a crash or a kill mid-resolution. Same self-healing posture as
+ * `pruneKnownDeadSources` (sources.ts): the mess clears itself on the next run
+ * instead of needing a documented manual step. Safe because a staged dir is
+ * scratch by construction and concurrent composition installs are not a
+ * supported scenario.
+ */
+async function sweepOrphanedStagingDirs(reposDir: string): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await readdir(reposDir);
+  } catch {
+    return; // reposDir may not exist yet
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(COMPOSE_STAGING_PREFIX)) continue;
+    await rm(join(reposDir, entry), { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Install one resolved member through the ORDINARY install path.
+ *
+ * `installPackageDependencies` established the pattern (arc#306): a package
+ * arc pulls in on another's behalf goes through the same `install()` every
+ * hand-typed install does, so it gets the same duplicate guards, the same
+ * broker gate, the same secrets/identity/postinstall steps, and the same DB
+ * bookkeeping. A composition member is that, with the reference's pin threaded
+ * through — no second installer to keep in step.
+ *
+ * `yes: true` unconditionally: the operator has ALREADY approved this member's
+ * capabilities, as part of the one combined review D2 promises. Re-prompting
+ * per member here is precisely the death-by-a-thousand-confirmations the
+ * combined review exists to prevent.
+ *
+ * ## The staging rename (arc#400 review, W2)
+ *
+ * A registry member is verified into `.compose-<scope>__<name>@<version>` — a
+ * scratch name, so a refusal mid-resolution leaves something obviously
+ * sweepable rather than something that looks installed. Immediately before it
+ * is handed to `install()` it is renamed to `<scope>__<name>`, the SAME name
+ * `arc install @scope/name` extracts to. Two reasons: a version-stamped install
+ * directory goes stale the moment the member is upgraded (arc#401 walks these
+ * paths and would find a directory whose name disagrees with the version
+ * installed in it), and a member installed as part of a composition should be
+ * indistinguishable on disk from the same member installed by hand.
+ */
+function createMemberInstaller(ctx: {
+  arc: ArcPaths;
+  host: HostAdapter;
+  db: Database;
+  hostOverrides?: HostOverrides;
+}) {
+  return async (member: ResolvedCompositionMember) => {
+    let preExtractedPath = member.preExtractedPath;
+
+    if (preExtractedPath) {
+      const ref = parsePackageRef(`${member.ref}@${member.reference.version}`);
+      if (ref) {
+        const target = join(ctx.arc.reposDir, `${ref.scope}__${ref.name}`);
+        if (target !== preExtractedPath) {
+          // A pre-existing dir here is a stale extract for the same package —
+          // install()'s duplicate guards (which run after this, on the DB) are
+          // what protect a real install; an orphan directory is just debris.
+          await rm(target, { recursive: true, force: true }).catch(() => undefined);
+          try {
+            await rename(preExtractedPath, target);
+            preExtractedPath = target;
+            member.preExtractedPath = target; // keep the sweep pointed at reality
+          } catch {
+            // Rename failed (cross-device, permissions). The staged dir is still
+            // a perfectly good source; carry on with the scratch name rather
+            // than failing an install over a cosmetic path.
+          }
+        }
+      }
+    }
+
+    const result = await install({
+      arc: ctx.arc,
+      host: ctx.host,
+      db: ctx.db,
+      repoUrl: preExtractedPath ? `${member.ref}@${member.reference.version}` : member.ref,
+      yes: true,
+      preExtractedPath,
+      pinnedRef: preExtractedPath ? undefined : member.pinnedRef,
+      hostOverrides: ctx.hostOverrides,
+    });
+    return {
+      success: result.success,
+      error: result.error,
+      name: result.name,
+      version: result.version,
+      alreadyInstalled: result.alreadyInstalled,
+    };
+  };
+}
+
+/**
+ * Present the ONE combined capability review and read the operator's answer.
+ *
+ * Same channel and same posture as `confirmCapabilityWidening`: an explicit
+ * `y` approves, everything else (including a non-TTY, which `readConsentLine`
+ * answers with "") refuses. The CLI's own non-TTY guard means an operator
+ * normally never reaches this without `--yes`; the refusal here is the
+ * defence-in-depth half, for the callers that reach `install()` directly.
+ */
+async function defaultCompositionConfirm(reviewLines: string[]): Promise<boolean> {
+  for (const line of reviewLines) console.log(line);
+  process.stdout.write("\nInstall this composition and all its members? [y/N] ");
+  const answer = (await readConsentLine()).trim().toLowerCase();
+  return answer === "y";
+}
+
+/** Fill any seam the caller left open with its production implementation. */
+function defaultCompositionSeams(
+  opts: InstallOptions,
+): Required<Pick<CompositionSeams, "probe" | "resolve" | "confirm" | "installMember">> &
+  CompositionSeams {
+  const provided = opts.composition ?? {};
+  return {
+    ...provided,
+    probe: provided.probe ?? defaultToolProbe,
+    resolve: provided.resolve ?? createReferenceResolver({ arc: opts.arc }),
+    confirm: provided.confirm ?? defaultCompositionConfirm,
+    installMember:
+      provided.installMember ??
+      createMemberInstaller({
+        arc: opts.arc,
+        host: opts.host,
+        db: opts.db,
+        hostOverrides: opts.hostOverrides,
+      }),
+  };
 }
 
 /** Read one line from stdin; "" when there is no TTY to read from. */
