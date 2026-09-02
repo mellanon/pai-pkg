@@ -49,6 +49,7 @@ import type {
   ToolRequirement,
 } from "../types.js";
 import { BASH_UNRESTRICTED, capabilityRows } from "./db.js";
+import { canonicalMemberKey } from "./composition-identity.js";
 import { PURGEABLE_OWNS_CLASSES, ownsEntriesOverlap } from "./owns.js";
 import { satisfiesRange } from "./semver.js";
 import type { Violation } from "./validate-manifest.js";
@@ -219,7 +220,9 @@ function validateReferences(references: unknown, composition: boolean, add: Add)
     return;
   }
 
-  const seen = new Set<string>();
+  // Canonical key → the FIRST label that claimed it, so a duplicate can name
+  // both spellings rather than only the one it tripped over.
+  const seenByKey = new Map<string, string>();
   references.forEach((entry, i) => {
     if (!isRecord(entry)) {
       add(`references[${i}]`, `must be a { name, version } object; got ${JSON.stringify(entry)}`);
@@ -249,9 +252,36 @@ function validateReferences(references: unknown, composition: boolean, add: Add)
       );
     }
 
+    // Duplicate detection keys on the CANONICAL member key, not the literal
+    // string (arc#401 review, F10). `@a/dup` and `dup` are two labels for ONE
+    // member — `skills.name` cannot hold both, and `composition_members` is
+    // keyed on the landed name — so a verbatim check let them through
+    // validation, through resolution, through landing, and into a PRIMARY KEY
+    // collision: an uncaught SQLiteError on the trust path, with the first
+    // member already installed and a `pending` record behind it. A refusal is
+    // the only acceptable outcome, and it names BOTH labels because the author
+    // is looking at two lines that do not obviously say the same thing.
     if (isNonEmptyString(name)) {
-      if (seen.has(name)) add(`references[${i}].name`, `is declared more than once: ${JSON.stringify(name)}`);
-      seen.add(name);
+      const key = canonicalMemberKey(name);
+      const first = seenByKey.get(key);
+      if (first === name) {
+        // The literal repeat. Kept verbatim: arc#402's publish side asserts
+        // this vocabulary as the shared validator's contract, and an author
+        // looking at two identical lines needs no explanation of why.
+        add(`references[${i}].name`, `is declared more than once: ${JSON.stringify(name)}`);
+      } else if (first !== undefined) {
+        // Two SPELLINGS of one member — the case F10 found. Worth its own
+        // message, because the author is looking at two lines that do not
+        // obviously say the same thing, so "declared more than once" would read
+        // as a false positive and get worked around.
+        add(
+          `references[${i}].name`,
+          `names the same member as ${JSON.stringify(first)}: ${JSON.stringify(name)} — scope and case do not distinguish members ` +
+            `('@scope/name' and 'name' are one package, and arc can install only one of them), so both entries resolve to a single install. Keep one.`,
+        );
+      } else {
+        seenByKey.set(key, name);
+      }
     }
 
     const version = entry.version;
@@ -1225,11 +1255,23 @@ export async function installCompositionMembers(
   const log = opts.log ?? ((line: string) => { console.log(line); });
   const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
   const landed: string[] = [];
+  // The names those members are INSTALLED under (arc#401 review, F11).
+  //
+  // `landed` holds reference LABELS, because that is what the caller's staging
+  // sweep filters on. The debris pointer must not: a member's label can differ
+  // from its manifest name (every `@scope/name` member, by construction), and
+  // `arc remove <label>` then fails with "not installed" — the one command the
+  // error hands an operator who is already having a bad day. Falls back to the
+  // label when the installer reported no name, which is the stub-installer case
+  // in tests and the only case where arc has nothing better to say.
+  const landedNames: string[] = [];
 
   const withDebris = (message: string): string =>
-    landed.length === 0
+    landedNames.length === 0
       ? `${message}\nNo member had landed yet — nothing to clean up.`
-      : `${message}\nAlready landed (left in place; \`arc remove <name>\` takes one down): ${landed.join(", ")}`;
+      : `${message}\nAlready landed (left in place; take one down with \`arc remove <name>\`): ${landedNames
+          .map((n) => `${n} (\`arc remove ${n}\`)`)
+          .join(", ")}`;
 
   for (const member of plan.members) {
     const label = `${member.reference.name}@${member.reference.version}`;
@@ -1246,23 +1288,30 @@ export async function installCompositionMembers(
       };
     }
 
-    // ROOT 1 — IDENTITY, before anything is recorded about this member. A
-    // package that landed under a different name than the reference gave it
-    // was reviewed under someone else's name and would be recorded under a key
-    // nothing installed; both halves of that are worse than a refusal, and the
-    // second is what made `arc purge` report a clean untangle over an installed
-    // member. Checked here rather than after the loop so the members that
-    // already landed are named in the error, like every other failure below.
+    landed.push(member.reference.name);
+    landedNames.push(result.name ?? member.reference.name);
+
+    // RECORD THE MEMBER FIRST, then decide whether to refuse (arc#401 review,
+    // F11). The member is on disk either way, and the row is what makes it
+    // REACHABLE: `arc purge <factory>` walks `composition_members` by the
+    // LANDED name, so a refusal that skipped this left the row carrying the
+    // label and the cascade silently stepped over an installed package. The
+    // caller's binding computes the right state (`landed` / `preexisting`) for
+    // a member that landed, and that reasoning does not change because the
+    // composition is about to be refused for a different reason.
+    opts.onMemberLanded?.(member, result.name, result.alreadyInstalled);
+
+    // ROOT 1 — IDENTITY. A package that landed under a different name than the
+    // reference gave it was reviewed under someone else's name, and the record
+    // every lifecycle command walks would key on a name nothing installed. Both
+    // halves are worse than a refusal, and the second is what made `arc purge`
+    // report a clean untangle over an installed member. Checked inside the loop
+    // so the members that already landed are named in the error, like every
+    // other failure here.
     if (result.name && opts.identityRefusalFor) {
       const refusal = opts.identityRefusalFor(member, result.name);
-      if (refusal) {
-        landed.push(member.reference.name);
-        return { success: false, landed, error: withDebris(refusal) };
-      }
+      if (refusal) return { success: false, landed, error: withDebris(refusal) };
     }
-
-    landed.push(member.reference.name);
-    opts.onMemberLanded?.(member, result.name, result.alreadyInstalled);
 
     // F2 — did what landed match what was approved?
     if (opts.recordedRowsFor && opts.reviewedRowsFor && result.name) {

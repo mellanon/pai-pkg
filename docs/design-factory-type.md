@@ -517,6 +517,33 @@ upgrade records `status: 'partial'` at the versions actually installed, so
 `arc install --pin` on a composition refuses and names `arc upgrade`; plain
 `arc remove <factory>` now says which members it orphaned.
 
+**Two follow-ups from verification.** Both are ROOT 1 consequences the first
+hardening pass did not chase far enough, and both were found by probing the
+NEW canonical key rather than the old code:
+
+*F10 — the duplicate check was still verbatim.* `references[]` could name
+`@a/dup` and `dup`, which the canonical key says are ONE member. Validation
+passed them, resolution passed them, the first landed, and the second collided
+on the `composition_members` primary key — an uncaught `SQLiteError` on the
+trust path, with a member installed and a `pending` record behind it. The check
+now keys on `canonicalMemberKey`. The message BRANCHES: a literal repeat keeps
+arc#402's "declared more than once" vocabulary (the publish side asserts it as
+the shared validator's contract), while two spellings of one member get their
+own line naming both — an author looking at two visibly different strings would
+read the generic message as a false positive and work around it.
+
+*F11 — the identity refusal left UNREACHABLE debris.* Two halves. The "already
+landed" pointer named reference LABELS, so `arc remove <label>` — the one
+command the error hands the operator — failed with "not installed" for exactly
+the members whose label differs from their manifest name. And the refusal
+returned BEFORE `onMemberLanded` ran, so the row kept the label and a later
+purge of the pending record stepped straight over an installed package: the
+same invisible-member failure ROOT 1 exists to close, reintroduced on the
+refusal path. The member is now RECORDED first — the caller's binding computes
+`landed`/`preexisting` exactly as it would otherwise, because the member is on
+disk either way — and the refusal comes second, with the pointer naming the
+landed name and a per-member command.
+
 **Residual risk after hardening.** The install-side `pending` window is
 narrowed, not eliminated — a kill between opening the record and marking a
 member leaves a row whose only evidence is a timestamp. `partial` compositions

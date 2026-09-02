@@ -17,7 +17,7 @@ import {
   replaceCompositionRecord,
 } from "../../src/lib/db.js";
 import { canonicalMemberKey } from "../../src/lib/composition-identity.js";
-import { compositionOwnsConflicts } from "../../src/lib/composition.js";
+import { compositionOwnsConflicts, validateCompositionFields } from "../../src/lib/composition.js";
 import type { ToolProbe } from "../../src/lib/composition.js";
 import { createTestEnv, createMockSkillRepo, type TestEnv } from "../helpers/test-env.js";
 
@@ -252,6 +252,145 @@ describe("arc#401 ROOT 1 — membership is keyed on the LANDED name, canonically
     expect(getSkill(env.db, "shared-core")).not.toBeNull();
     expect(listSkills(env.db).map((s) => s.name).sort()).toEqual(["factory-b", "shared-core"]);
   }, 180_000);
+});
+
+describe("arc#401 F10 — two labels for ONE member are refused at validation, never at the DB", () => {
+  test("validateCompositionFields catches the canonical duplicate and names both labels", () => {
+    const violations = validateCompositionFields({
+      name: "dup-factory",
+      version: "0.1.0",
+      type: "factory",
+      references: [
+        { name: "@a/dup", version: "1.0.0", repo: "/tmp/dup" },
+        { name: "dup", version: "1.0.0", repo: "/tmp/dup" },
+      ],
+    });
+    const duplicate = violations.filter((v) => v.rule.includes("same member"));
+    expect(duplicate).toHaveLength(1);
+    expect(duplicate[0].field).toBe("references[1].name");
+    expect(duplicate[0].rule).toContain("@a/dup");
+    expect(duplicate[0].rule).toContain("dup");
+  });
+
+  test("a case-variant duplicate is caught too", () => {
+    const violations = validateCompositionFields({
+      name: "dup-factory",
+      version: "0.1.0",
+      type: "factory",
+      references: [
+        { name: "Cortex", version: "1.0.0", repo: "/tmp/c" },
+        { name: "cortex", version: "1.0.0", repo: "/tmp/c" },
+      ],
+    });
+    expect(violations.some((v) => v.rule.includes("same member"))).toBe(true);
+  });
+
+  test("install REFUSES — no crash, no landed member, no pending debris", async () => {
+    env = await createTestEnv();
+
+    const dup = await createMockSkillRepo(env.root, { name: "dup", version: "1.0.0" });
+    tagRepo(dup.path, "1.0.0");
+
+    const factory = await writeFactoryRepo(env.root, "dup-factory", {
+      references: [
+        { name: "@a/dup", version: "1.0.0", repo: dup.url },
+        { name: "dup", version: "1.0.0", repo: dup.url },
+      ],
+    });
+
+    // The failure mode being locked out is a THROW: the two labels used to pass
+    // validation, resolve, land, and then collide on the composition_members
+    // primary key — an uncaught SQLiteError on the trust path.
+    let threw: unknown = null;
+    const result = await install({
+      arc: env.arc, host: env.host, db: env.db, repoUrl: factory, yes: true,
+      composition: { probe: allToolsPresent },
+    }).catch((err: unknown) => {
+      threw = err;
+      return { success: false, error: "THREW" };
+    });
+
+    expect(threw).toBeNull();
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("@a/dup");
+    // Refused at validation, so nothing was even resolved.
+    expect(listSkills(env.db)).toEqual([]);
+    expect(compositionRecord(env.db, "dup-factory")).toBeNull();
+  }, 120_000);
+});
+
+describe("arc#401 F11 — an identity refusal leaves REACHABLE debris", () => {
+  test("the remove pointer names the LANDED name, and that command works", async () => {
+    env = await createTestEnv();
+
+    const member = await createMockSkillRepo(env.root, {
+      name: "the-compass-core",
+      version: "1.0.0",
+    });
+    tagRepo(member.path, "1.0.0");
+    const factory = await writeFactoryRepo(env.root, "label-factory", {
+      references: [{ name: "compass-core", version: "1.0.0", repo: member.url }],
+    });
+
+    const result = await install({
+      arc: env.arc, host: env.host, db: env.db, repoUrl: factory, yes: true,
+      composition: { probe: allToolsPresent },
+    });
+    expect(result.success).toBe(false);
+
+    // The debris pointer must name the package that IS installed. Naming the
+    // label hands the operator a command that fails.
+    expect(result.error).toContain("arc remove the-compass-core");
+
+    // …and it really works.
+    const removed = await remove(env.db, env.arc, env.host, "the-compass-core", {
+      yes: true,
+      quiet: true,
+    });
+    expect(removed.success).toBe(true);
+    expect(getSkill(env.db, "the-compass-core")).toBeNull();
+  }, 120_000);
+
+  test("purging the pending record REACHES the member the refusal left behind", async () => {
+    env = await createTestEnv();
+
+    const member = await createMockSkillRepo(env.root, {
+      name: "the-compass-core",
+      version: "1.0.0",
+      owns: { config: ["~/.config/metafactory/compass"] },
+    });
+    tagRepo(member.path, "1.0.0");
+    const factory = await writeFactoryRepo(env.root, "label-factory", {
+      references: [{ name: "compass-core", version: "1.0.0", repo: member.url }],
+    });
+
+    expect(
+      (
+        await install({
+          arc: env.arc, host: env.host, db: env.db, repoUrl: factory, yes: true,
+          composition: { probe: allToolsPresent },
+        })
+      ).success,
+    ).toBe(false);
+
+    // The row must carry the LANDED name — otherwise the pending record points
+    // at a package that does not exist and the cascade silently skips it.
+    const rows = compositionMembers(env.db, "label-factory");
+    expect(rows.map((r) => r.member_name)).toEqual(["the-compass-core"]);
+    expect(rows.map((r) => r.member_label)).toEqual(["compass-core"]);
+    expect(compositionRecord(env.db, "label-factory")!.status).toBe("pending");
+
+    await mkdir(join(env.root, ".config/metafactory/compass"), { recursive: true });
+
+    const purged = await purge(env.db, env.arc, env.host, "label-factory", {
+      yes: true, quiet: true, home: env.root,
+    });
+    expect(purged.success).toBe(true);
+    expect(purged.composition!.purged).toEqual(["the-compass-core"]);
+    expect(listSkills(env.db)).toEqual([]);
+    expect(compositionRecord(env.db, "label-factory")).toBeNull();
+    expect(existsSync(join(env.root, ".config/metafactory/compass"))).toBe(false);
+  }, 120_000);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
