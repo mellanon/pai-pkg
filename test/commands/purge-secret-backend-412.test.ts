@@ -1,10 +1,12 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { join } from "path";
+import { existsSync, readdirSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import YAML from "yaml";
 import { install } from "../../src/commands/install.js";
 import { purge, formatPurge } from "../../src/commands/purge.js";
-import { listSkills } from "../../src/lib/db.js";
+import { getSkill, listSkills } from "../../src/lib/db.js";
+import { extractRepoName } from "../../src/lib/repo-name.js";
 import type { ToolProbe } from "../../src/lib/composition.js";
 import { createTestEnv, createMockSkillRepo, type TestEnv } from "../helpers/test-env.js";
 
@@ -186,5 +188,86 @@ describe("arc#412 — an unconstructible secret backend degrades, never aborts",
     expect(result.success).toBe(true);
     expect(result.secretsSkipped).toEqual([]);
     expect(formatPurge(result)).not.toContain("no secrets to purge");
+  });
+});
+
+/**
+ * arc#412 W1 — the INSTALL side of the same construction bug, end to end.
+ *
+ * The purge tests above cannot reach this: their scoped member declares no
+ * secrets, so `installTimeProvisionSecrets` short-circuits on
+ * `declared.length === 0` and never builds a backend at all. Only a scoped name
+ * that DECLARES `capabilities.secrets` gets as far as the constructor.
+ *
+ * Before the fix, that throw escaped `installTimeProvisionSecrets` and crashed
+ * `install()` — which meant it also blew past `install.ts`'s own rollback for a
+ * failed secret step (`rm -rf installPath`, arc#373), stranding the clone. This
+ * asserts the unwind for real rather than by reading the source: install
+ * returns a value, and the clone is gone from disk.
+ */
+describe("arc#412 W1 — install fails closed and UNWINDS on an unbuildable backend", () => {
+  test("a scoped name declaring secrets aborts the install and removes the clone", async () => {
+    env = await createTestEnv();
+
+    const scoped = await createMockSkillRepo(env.root, {
+      name: SCOPED,
+      version: "1.0.0",
+      // The declaration is the whole point: without it the secrets step never
+      // constructs a backend and this path is unreachable.
+      capabilities: { secrets: ["COMPASS_TOKEN"] },
+    });
+
+    // The path install would clone to — derived the same way install derives
+    // it, not hardcoded.
+    const installPath = join(env.arc.reposDir, extractRepoName(scoped.url));
+
+    // No `secretBackendInstance` seam: the REAL construction must run.
+    const result = await install({
+      arc: env.arc,
+      host: env.host,
+      db: env.db,
+      repoUrl: scoped.url,
+      yes: true,
+    });
+
+    // 1. A returned failure, not a thrown one — and the reason survives.
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Secret provisioning failed");
+    expect(result.error).toContain("invalid agent name");
+
+    // 2. THE ROLLBACK RAN: the clone is gone, and no other clone was left
+    //    behind under repos/ either (`.gitkeep` is the dir's own placeholder).
+    expect(existsSync(installPath)).toBe(false);
+    expect(readdirSync(env.arc.reposDir).filter((e) => !e.startsWith("."))).toEqual([]);
+
+    // 3. Nothing landed on the host, and no DB row was written.
+    expect(existsSync(join(env.host.paths.skillsDir, SCOPED))).toBe(false);
+    expect(getSkill(env.db, SCOPED)).toBeNull();
+  });
+
+  test("the same package WITHOUT declared secrets installs and does clone (control)", async () => {
+    env = await createTestEnv();
+
+    // Same scoped name, same shape, no `capabilities.secrets`. This proves the
+    // assertions above measure the ROLLBACK and not a name that simply never
+    // clones: the secrets declaration is the only difference.
+    const scoped = await createMockSkillRepo(env.root, {
+      name: SCOPED,
+      version: "1.0.0",
+    });
+
+    const installPath = join(env.arc.reposDir, extractRepoName(scoped.url));
+
+    const result = await install({
+      arc: env.arc,
+      host: env.host,
+      db: env.db,
+      repoUrl: scoped.url,
+      yes: true,
+    });
+
+    expect(result.success).toBe(true);
+    expect(existsSync(installPath)).toBe(true);
+    expect(getSkill(env.db, SCOPED)?.install_path).toBe(installPath);
   });
 });

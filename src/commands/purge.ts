@@ -824,10 +824,14 @@ function openSecretBackend(
  * F1).
  *
  * The degradation is sound, not a paper-over: a namespace that cannot be OPENED
- * cannot have been WRITTEN either — the same guard runs on the store path — so
- * there is provably nothing under it to purge and nothing to leak. Returning
- * early also keeps the unvalidated `name` out of the `rm` sweep below, which is
- * the other reason not to simply catch-and-continue past the construction.
+ * cannot have been WRITTEN BY ARC either. The guard has run in the constructor
+ * since the backends landed (#234), so no arc version has ever created such a
+ * namespace — there is no arc-written state under it to purge or to leak. A
+ * hand-planted directory at that path does survive, and surfaces as reported
+ * residue in the untangle diff, which is the right outcome for something arc did
+ * not put there. Returning early also keeps the unvalidated `name` out of the
+ * `rm` sweep below, which is the other reason not to simply catch-and-continue
+ * past the construction.
  *
  * It is degraded, never silent: the caller threads the skip into the purge
  * report by name and reason.
