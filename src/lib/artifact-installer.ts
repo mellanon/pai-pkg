@@ -3,6 +3,7 @@ import { existsSync, readdirSync } from "fs";
 import { mkdir } from "fs/promises";
 import { readFileSync } from "fs";
 import YAML from "yaml";
+import { ARTIFACT_TYPES } from "../types.js";
 import type {
   ArtifactType,
   ArcManifest,
@@ -29,36 +30,26 @@ import { isDarwinLaunchdHost } from "./hosts/darwin-launchd.js";
 import { isLinuxSystemdHost } from "./hosts/linux-systemd.js";
 
 /**
- * The complete set of manifest `type`s arc can install (arc#334). This is the
- * INSTALLER side of the validator↔installer type-set contract: the strict
- * validator's `VALID_TYPES` (validate-manifest.ts) must equal this set exactly,
- * asserted by a parity test so the two can't drift again (the drift that let
- * `type: bundle` validate green yet throw at install).
+ * The complete set of manifest `type`s arc can install (arc#334) — DERIVED from
+ * the single source `ARTIFACT_TYPES` (src/types.ts) since arc#399
+ * (`docs/design-factory-type.md` D7.1). This is the INSTALLER side of the
+ * validator↔installer type-set contract: the strict validator's `VALID_TYPES`
+ * (validate-manifest.ts) must equal this set exactly. Both derive from the same
+ * array now, so parity holds BY CONSTRUCTION; the parity test still asserts it
+ * so a future hand-copy is caught the moment it reappears.
  *
- * It is the union of:
- *   - every case handled by `planArtifactSymlinks` below — skill, system, tool,
- *     agent, prompt, component, pipeline, rules, action, governance; and
- *   - the two types intercepted earlier, in `readManifest` (manifest.ts), which
- *     never reach `planArtifactSymlinks` — library and process.
+ * Every value is reachable without throwing:
+ *   - handled by a `planArtifactSymlinks` case below — skill, system, tool,
+ *     agent, prompt, component, pipeline, rules, action, governance, plus the
+ *     composition types bundle + factory (which plan NOTHING per-type);
+ *   - intercepted earlier, in `readManifest` (manifest.ts), and so never
+ *     reaching `planArtifactSymlinks` — library and process.
  *
- * A new installable type means: add a `planArtifactSymlinks` case (or a
- * readManifest special-case) AND add it here AND to `VALID_TYPES`. `bundle` is
- * deliberately absent — it is a repo-name class, not a manifest type.
+ * A new installable type means exactly one enum edit (`ARTIFACT_TYPES`) plus a
+ * `planArtifactSymlinks` case or a `readManifest` special-case, so it cannot
+ * fall through to the `default:` throw.
  */
-export const INSTALLABLE_ARTIFACT_TYPES = [
-  "skill",
-  "system",
-  "tool",
-  "agent",
-  "prompt",
-  "component",
-  "pipeline",
-  "rules",
-  "action",
-  "library",
-  "process",
-  "governance",
-] as const;
+export const INSTALLABLE_ARTIFACT_TYPES = ARTIFACT_TYPES;
 
 /**
  * Maps an artifact type to its conventional source subdirectory within a cloned repo.
@@ -231,6 +222,28 @@ export function planArtifactSymlinks(opts: ArtifactSymlinkOpts): ArtifactSymlink
 
     case "component": {
       // No per-type primary layout -- provides.files only (handled below).
+      break;
+    }
+
+    case "bundle":
+    case "factory": {
+      // COMPOSITION types (arc#399, docs/design-factory-type.md D1/D7.2). A
+      // bundle/factory tarball carries no artifact payload of its own -- only a
+      // manifest whose references[] name other published packages -- so there is
+      // NO per-type symlink to plan. Deliberately not a `default:` fall-through:
+      // an explicit case is what keeps the switch from throwing "Unsupported
+      // artifact type" on a value the validator now accepts (the arc#334 failure
+      // mode, in reverse).
+      //
+      // `provides.files` is still honored, by the type-agnostic pass below --
+      // that is how a composition can drop its own README/config alongside its
+      // members. Installing the MEMBERS is reference resolution, which is the
+      // next slice and lives nowhere in this file yet; until it lands a
+      // bundle/factory install is a manifest-only no-op rather than an error.
+      //
+      // `library` never reaches here: readManifest (manifest.ts) intercepts it
+      // and walks `artifacts[]` instead. The three composition types therefore
+      // split across two mechanisms on purpose, not by oversight.
       break;
     }
 

@@ -34,7 +34,11 @@ export function mapApiPackageToRegistryEntry(pkg: MetafactoryPackageListItem): {
     status: "shipped",
   };
 
-  // Map API type to arc ArtifactType
+  // Map INBOUND registry type → arc ArtifactType. This is deliberately NOT the
+  // arc type enum (ARTIFACT_TYPES) — it is the fold from the registry's
+  // vocabulary into arc's, so registry-only values land on the nearest arc type
+  // (D7.3: `playbook` and `graph` stay registry-only until an arc consumer
+  // exists, so they fold rather than being added to arc's enum).
   const typeMap: Record<string, ArtifactType> = {
     skill: "skill",
     tool: "tool",
@@ -46,6 +50,11 @@ export function mapApiPackageToRegistryEntry(pkg: MetafactoryPackageListItem): {
     rules: "skill", // rules are a skill subtype in arc
     playbook: "skill",
     graph: "component",
+    // arc#399: arc now has these types, so a registry bundle/factory keeps its
+    // own identity instead of being displayed as a skill by the `?? "skill"`
+    // fallback below.
+    bundle: "bundle",
+    factory: "factory",
   };
   const artifactType: ArtifactType = typeMap[pkg.type] ?? "skill";
 

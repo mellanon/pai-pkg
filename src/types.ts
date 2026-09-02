@@ -2,8 +2,20 @@
 
 // ── Artifact types ─────────────────────────────────────────────
 
-/** The artifact classes arc installs. */
-export type ArtifactType = "skill" | "system" | "agent" | "prompt" | "tool" | "component" | "pipeline" | "process" | "rules" | "library" | "action" | "governance";
+/**
+ * arc's manifest `type` vocabulary. DEFINED in `./artifact-types.js` (a
+ * dependency-free leaf module) and re-exported here so `src/types.ts` stays the
+ * one import site every consumer already uses.
+ *
+ * Why the definition is not inline: `types.ts` re-exports `ArtifactInstallState`
+ * from `lib/install-transaction.js`, which imports `lib/artifact-installer.js`,
+ * which imports back from here. That cycle is harmless for erased type
+ * declarations but a temporal-dead-zone crash for a `const` — the installer
+ * would read `ARTIFACT_TYPES` before this module finished evaluating. Keeping
+ * the array in a module with ZERO imports makes it unreachable by any cycle.
+ */
+import type { ArtifactType } from "./artifact-types.js";
+export { ARTIFACT_TYPES, type ArtifactType } from "./artifact-types.js";
 
 // ── Registry types ────────────────────────────────────────────
 
@@ -413,7 +425,16 @@ export interface ArcManifest {
   schema?: "arc/v1" | "pai/v1";
   name: string;
   version: string;
-  type: "skill" | "system" | "tool" | "agent" | "prompt" | "component" | "pipeline" | "process" | "rules" | "library" | "action" | "governance";
+  /**
+   * The manifest type. Derived from {@link ARTIFACT_TYPES} — this used to be a
+   * third hand-copied literal union (arc#399 / D7.1).
+   *
+   * NOTE the word "bundle" carries two unrelated meanings on this interface and
+   * both are legitimate (`docs/design-factory-type.md` D1): `type: "bundle"` is
+   * the reference-composition MANIFEST TYPE, while the `bundle?: BundleConfig`
+   * field below is the publish-time tarball include/exclude config.
+   */
+  type: ArtifactType;
   /** Only present when type is "library" — lists contained artifacts */
   artifacts?: LibraryArtifactEntry[];
   /**

@@ -16,6 +16,7 @@
  * from the loader — that alias removal is arc#280.
  */
 
+import { ARTIFACT_TYPES } from "../types.js";
 import { toStrictName } from "./repo-name.js";
 import { validateOwns } from "./owns.js";
 
@@ -48,32 +49,36 @@ const REQUIRED_SCHEMA = "arc/v1";
 const REJECTED_SCHEMA = "pai/v1";
 
 /**
- * Package types strict mode accepts — the canonical `ArcManifest.type` set arc
- * can actually install (with `action` — arc#95). These MUST stay in lockstep
- * with the installer's supported set (`INSTALLABLE_ARTIFACT_TYPES` in
- * artifact-installer.ts); a parity test asserts it so they can't drift (arc#334).
+ * Package types strict mode accepts — DERIVED from the single source
+ * `ARTIFACT_TYPES` (src/types.ts), per `docs/design-factory-type.md` D7.1.
+ * This was a hand-copied second list until arc#399; deriving is what makes the
+ * arc#334 validator↔installer parity invariant hold BY CONSTRUCTION rather than
+ * by vigilance. The parity test (test/unit/type-set-parity.test.ts) still runs —
+ * it now guards the derivation itself instead of policing a copy.
  *
- * `bundle` is deliberately NOT here (arc#334, decision b): the installer has no
- * `bundle` case, so accepting it here let a manifest validate green yet throw at
- * `arc install`. `bundle` is a REPO-NAME class (metafactory-bundle-<name>), not
- * a manifest type — bundle-class repos declare an installable type (the
- * class-choice rule maps them to skill/tool; e.g. metafactory-bundle-discord is
- * `type: skill`, metafactory-bundle-content-filter is `type: tool`).
+ * ## The two meanings of "bundle" — both real, kept distinct (D1)
+ *
+ * arc's naming doctrine and the registry's type taxonomy use the same word for
+ * different things, and `docs/design-factory-type.md` D1 rules that BOTH
+ * survive. Do not collapse them:
+ *
+ *   1. REPO-NAME CLASS — `metafactory-bundle-<name>` is a *naming* convention
+ *      for a repo shipping several related files. Its members declare an
+ *      ordinary installable type: metafactory-bundle-discord is `type: skill`,
+ *      metafactory-bundle-content-filter is `type: tool`. Nothing about the repo
+ *      name implies `type: bundle`.
+ *   2. MANIFEST TYPE — `type: bundle` (registry DD-111, DB migration
+ *      `0012_add_bundle_type.sql`) is the reference-composition: the tarball
+ *      carries only a manifest whose `references[]` name published packages.
+ *
+ * arc#334 previously rejected `type: bundle` here because the installer had no
+ * case for it — a manifest could validate green and then throw at `arc install`.
+ * arc#399 closes that gap from the other side: `bundle` (and `factory`) are in
+ * the source enum AND handled by `planArtifactSymlinks` as composition types
+ * that plan no per-type symlinks, so validator and installer agree again.
+ * `factory` sidesteps the ambiguity entirely by not reusing the word (D1).
  */
-export const VALID_TYPES = [
-  "skill",
-  "system",
-  "tool",
-  "agent",
-  "prompt",
-  "component",
-  "pipeline",
-  "process",
-  "rules",
-  "library",
-  "action",
-  "governance",
-] as const;
+export const VALID_TYPES = ARTIFACT_TYPES;
 
 /** Trust tiers strict mode accepts (issue #317 adds `core` over spec §4.1). */
 const VALID_TIERS = ["official", "community", "custom", "core"] as const;
