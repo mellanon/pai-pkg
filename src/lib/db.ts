@@ -80,7 +80,106 @@ export function openDatabase(dbPath: string): Database {
     );
   `);
 
+  // The COMPOSITION a `type: bundle` / `type: factory` install resolved
+  // (arc#400, docs/design-factory-type.md D2/D4).
+  //
+  // Deliberately minimal: the member list plus the version each was PINNED to,
+  // in declaration order, with the address that resolved it. That is exactly
+  // what makes a factory release a reproducible snapshot (D4) and exactly what
+  // the lifecycle slice needs.
+  //
+  // ── INPUT TO arc#401 ──────────────────────────────────────────────────────
+  // #401 (upgrade / files / purge cascade, D3+D6) reads these rows as its
+  // membership source of truth: `arc upgrade <factory>` moves members to the
+  // NEW release's pins by diffing against these; `arc files <factory>` unions
+  // the member footprints these name; `arc purge <factory>` cascades over them,
+  // refcounted per arc#349. Nothing else is stored here on purpose — the
+  // install-time inventory snapshot D6 asks for is #401's to design, and a
+  // half-guessed schema for it now would be one #401 has to migrate away from.
+  // The FK cascade means removing the composition row removes its membership,
+  // so a `arc remove <factory>` can never leave orphaned member rows behind.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS composition_members (
+      composition_name TEXT NOT NULL,
+      member_name TEXT NOT NULL,
+      member_version TEXT NOT NULL,
+      member_source TEXT NOT NULL,
+      member_ref TEXT NOT NULL,
+      position INTEGER NOT NULL,
+      PRIMARY KEY (composition_name, member_name),
+      FOREIGN KEY (composition_name) REFERENCES skills(name) ON DELETE CASCADE
+    );
+  `);
+
   return db;
+}
+
+/** One row of `composition_members` — a pinned member of a bundle/factory. */
+export interface CompositionMemberRow {
+  composition_name: string;
+  member_name: string;
+  member_version: string;
+  /** How the member was addressed: "registry" (`@scope/name`) or "repo" (URL). */
+  member_source: string;
+  /** The address itself, so a re-resolve does not have to guess. */
+  member_ref: string;
+  /** Declaration order in `references[]`, preserved for reproducibility. */
+  position: number;
+}
+
+/**
+ * Record the composition an install resolved, replacing any previous one for
+ * the same name (arc#400 D2/D4).
+ *
+ * Replace-not-merge: the composition IS the release's member list, so an
+ * upgrade that drops a member must drop its row too. Runs in a transaction so
+ * a composition is never observable half-rewritten.
+ */
+export function recordComposition(
+  db: Database,
+  compositionName: string,
+  members: readonly {
+    name: string;
+    version: string;
+    source: string;
+    ref: string;
+  }[],
+): void {
+  const insert = db.prepare(`
+    INSERT INTO composition_members
+      (composition_name, member_name, member_version, member_source, member_ref, position)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM composition_members WHERE composition_name = ?").run(compositionName);
+    members.forEach((member, position) => {
+      insert.run(compositionName, member.name, member.version, member.source, member.ref, position);
+    });
+  });
+  tx();
+}
+
+/** The pinned members of `compositionName`, in declaration order. */
+export function compositionMembers(db: Database, compositionName: string): CompositionMemberRow[] {
+  return db
+    .prepare(
+      "SELECT * FROM composition_members WHERE composition_name = ? ORDER BY position",
+    )
+    .all(compositionName) as CompositionMemberRow[];
+}
+
+/** Every recorded composition, keyed by composition name (for `arc list`). */
+export function allCompositions(db: Database): Map<string, CompositionMemberRow[]> {
+  const rows = db
+    .prepare("SELECT * FROM composition_members ORDER BY composition_name, position")
+    .all() as CompositionMemberRow[];
+  const byName = new Map<string, CompositionMemberRow[]>();
+  for (const row of rows) {
+    const existing = byName.get(row.composition_name) ?? [];
+    existing.push(row);
+    byName.set(row.composition_name, existing);
+  }
+  return byName;
 }
 
 /**

@@ -1,9 +1,17 @@
 import type { Database } from "bun:sqlite";
-import { listSkills, listByLibrary } from "../lib/db.js";
+import { allCompositions, listSkills, listByLibrary } from "../lib/db.js";
+import type { CompositionMemberRow } from "../lib/db.js";
 import type { ArtifactType, InstalledSkill } from "../types.js";
 
 export interface ListResult {
   skills: InstalledSkill[];
+  /**
+   * Resolved membership for every installed `bundle`/`factory`, keyed by
+   * composition name (arc#400 D2/D4). Absent when a caller built a ListResult
+   * without one — `formatListJson` then simply omits the key, so an older
+   * caller keeps its exact previous output.
+   */
+  compositions?: Map<string, CompositionMemberRow[]>;
 }
 
 export interface ListOptions {
@@ -26,23 +34,49 @@ export function list(db: Database, opts?: ListOptions): ListResult {
   if (opts?.type) {
     skills = skills.filter((s) => s.artifact_type === opts.type);
   }
-  return { skills };
+  return { skills, compositions: allCompositions(db) };
 }
 
 /**
  * Format installed packages as JSON for machine consumption.
+ *
+ * A `bundle`/`factory` gains a `composition` object naming its resolved
+ * members and the version each is PINNED to, in declaration order (arc#400
+ * D2/D4). This is the machine-readable half of "the composition is recorded":
+ * `arc list --json | jq '.packages[] | select(.composition)'` answers "what is
+ * this factory made of, exactly" without opening the database — and it is the
+ * surface the lifecycle slice (arc#401) reads for upgrade/files/purge cascade.
+ *
+ * The key is OMITTED for a package with no recorded members, so every existing
+ * consumer of this output sees byte-identical JSON for a non-composition
+ * package.
  */
 export function formatListJson(result: ListResult): string {
-  const packages = result.skills.map((s) => ({
-    name: s.name,
-    version: s.version,
-    type: s.artifact_type,
-    status: s.status,
-    tier: s.tier,
-    repoUrl: s.repo_url,
-    installPath: s.install_path,
-    ...(s.library_name ? { library: s.library_name } : {}),
-  }));
+  const packages = result.skills.map((s) => {
+    const members = result.compositions?.get(s.name);
+    return {
+      name: s.name,
+      version: s.version,
+      type: s.artifact_type,
+      status: s.status,
+      tier: s.tier,
+      repoUrl: s.repo_url,
+      installPath: s.install_path,
+      ...(s.library_name ? { library: s.library_name } : {}),
+      ...(members?.length
+        ? {
+            composition: {
+              members: members.map((m) => ({
+                name: m.member_name,
+                version: m.member_version,
+                source: m.member_source,
+                ref: m.member_ref,
+              })),
+            },
+          }
+        : {}),
+    };
+  });
   return JSON.stringify({ packages }, null, 2);
 }
 

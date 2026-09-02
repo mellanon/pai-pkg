@@ -371,9 +371,66 @@ installer and the publish validator all derive from it, so `arc validate`,
 Compositions carry no artifact payload of their own, so they may omit the
 `capabilities:` block that every other type must declare: a composition's real
 capability surface is the union of its members', reviewed in one prompt at
-install time. `bundle` and `factory` reference resolution is landing
-incrementally — see
-[`docs/design-factory-type.md`](docs/design-factory-type.md).
+install time. See [`docs/design-factory-type.md`](docs/design-factory-type.md).
+
+#### Installing a composition: `references[]`, `tools:`, `produces:`
+
+```yaml
+schema: arc/v1
+name: software-factory
+version: 0.1.0
+type: factory
+tier: custom
+
+# The MEMBERS. Every version is EXACT — a factory release is a reproducible
+# snapshot, so a range (">=6.0.0", "^1.2.0", "latest") is refused at install
+# and at publish. Address a member either by its scoped registry name, or by
+# a repo URL (checked out at the tag for that version).
+references:
+  - name: "@metafactory/cortex"
+    version: 6.1.0
+  - name: compass-core
+    version: 0.4.0
+    repo: https://github.com/the-metafactory/compass-core
+
+# HOST BINARIES the composition needs. Checked BEFORE any member is fetched;
+# a missing binary refuses the install by name. Unlike `depends_on.tools`
+# (surfaced but not verified), this is a precondition.
+tools:
+  - name: git
+  - name: gh
+    reason: PR automation
+  - name: bun
+    version: ">=1.2.0"
+
+# What the composition exists to provide.
+produces: software
+```
+
+`arc install <factory>` is **one command and one decision**:
+
+1. the manifest is validated — a range pin is a loud refusal;
+2. `tools:` is checked against the host — a missing binary refuses, naming it,
+   before a single byte is fetched;
+3. every reference is resolved and every member manifest read and validated —
+   **any** member failing aborts the whole install *before any member lands*;
+4. the members' capability surfaces are combined into **one** review — the full
+   union, deduped, each entry attributed to the member(s) that asked for it,
+   with unrestricted bash flagged and the combined risk computed over the union
+   (two members that are each merely `medium` can compose to `high`);
+5. one confirmation (or `--yes`, which still prints the approved surface to
+   stderr for the record) — then all members install.
+
+The resolved membership and its pins are recorded and readable:
+
+```bash
+arc list --json | jq '.packages[] | select(.composition) | .composition.members'
+```
+
+Two things are deliberately *warnings*, not refusals: a factory declaring a
+higher `tier:` than the MIN of its members' (trust never averages up, so treat
+the composition as the MIN), and a tool whose `--version` output arc cannot
+parse.
 
 #### "bundle" means two different things — both are correct
 

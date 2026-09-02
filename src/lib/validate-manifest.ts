@@ -19,6 +19,7 @@
 import { ARTIFACT_TYPES } from "../types.js";
 import { toStrictName } from "./repo-name.js";
 import { validateOwns } from "./owns.js";
+import { validateCompositionFields } from "./composition.js";
 
 /** One rule failure. The CLI renders it as `<field>: <rule>` on its own line. */
 export interface Violation {
@@ -161,6 +162,14 @@ export function validateStrictManifest(input: StrictValidationInput): Violation[
   validateCapabilities(manifest, add);
   validateNamespace(manifest, add);
   validateSkillFrontmatterName(input.skillFrontmatterName, derivedName, manifest, add);
+  // references[]/tools[]/produces: the composition declarations (arc#400,
+  // docs/design-factory-type.md D1/D4). Same shared-validator posture as
+  // `owns` below — `arc validate` and `arc install` call the SAME pure
+  // function, so the publish gate and the install gate can never drift into
+  // disagreeing about the same manifest (the exact failure arc#399 closed for
+  // the type enum). D4's exact-pin rule is enforced from both ends by
+  // construction rather than by a second hand-written copy of the rule.
+  for (const v of validateCompositionFields(manifest)) add(v.field, v.rule);
   // owns: shared shape/safety gate (arc#359). Reuses the same pure validator the
   // lenient loader throws on, so `arc validate` and install agree byte-for-byte.
   for (const v of validateOwns(manifest.owns)) add(v.field, v.rule);
